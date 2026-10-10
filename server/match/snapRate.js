@@ -1,18 +1,14 @@
-// server/match/snapRate.js — the adaptive battle-snapshot rate (DESIGN §4, §8.2).
+// server/match/snapRate.js — the battle-snapshot rate (DESIGN §4, §8.2). RETIRED ADAPTIVE GEAR — see below.
 //
-// Every watched field streams `b.snap` to each of its watchers every SNAPSHOT_EVERY ticks (4 = 15 Hz at 2×); a
-// connection whose own link is jittery enough to need it gets SNAPSHOT_EVERY_FAST (3 = 20 Hz) instead. On a quiet
-// link the base rate costs nothing extra — the client interpolates between snapshots. On a jittery one the lower
-// rate costs smoothness:
+// 2026-10-11: the adaptive second gear is gone. There is one rate per ROLE, chosen by whether the watcher drives
+// the field: SNAPSHOT_EVERY (3 ticks = 20 Hz at 2×) for a field's own players, SNAPSHOT_EVERY_IDLE (12 ticks =
+// 5 Hz) for anything that merely watches. The decision and its reasoning live in server/sim/constants.js; the
+// emit site is server/match/fields.js _emit, and it no longer consults this module for a per-link upgrade.
 //
-//   the client's interpolation buffer trails the newest snapshot by `delay` = 100 ms (public/js/render/interp.js),
-//   which at 10 Hz was exactly one snapshot interval — zero slack, every bit of arrival jitter ran the render clock
-//   past the newest snapshot, and past `maxExtrapolate` (120 ms) the view froze. The base rate is 15 Hz for that
-//   reason: 100 ms covers 1.5 intervals there (2.0 at 20 Hz), so it absorbs ~33 ms of arrival jitter where 10 Hz
-//   absorbed none, and the fast rate stays the fallback for worse links.
-//
-// Measured at the 10/20 Hz pair with the real buffer fed jittered arrival times (probe-interp-jitter.mjs, four
-// committed perf specs):
+// Why it was retired rather than retuned: the two rates were 15 Hz and 20 Hz, bought against the client's 100 ms
+// interpolation buffer (public/js/render/interp.js), which at 10 Hz had zero jitter slack — every bit of arrival
+// jitter ran the render clock past the newest snapshot, and past `maxExtrapolate` (120 ms) the view froze. The
+// measured pair, from the real buffer fed jittered arrival times (probe-interp-jitter.mjs):
 //
 //     jitter   10 Hz extrapolated frames   20 Hz extrapolated frames
 //     30 ms                 0.1%                      0.0%
@@ -20,37 +16,45 @@
 //     75 ms                 4.2%                      0.6%
 //    150 ms                11.2%                      3.6%
 //
-// The 15 Hz base sits between those two columns (its 100 ms buffer covers 1.5 intervals, so its extrapolation rates
-// sit between theirs). SNAP_ESCALATE_MS = 50 is therefore conservative for the base that ships: escalation happens
-// before it is strictly needed. Recalibrating the threshold against a 15 Hz measurement is an open item (the probe
-// is not in the tree) — do not replace this table with an estimate.
+// That table justified ESCALATING to 20 Hz, not pinning it — but once 20 Hz is the base for everyone who drives a
+// field, its 100 ms buffer covers two intervals (the slack the old fast gear was bought to secure) and a
+// link-dependent upgrade has nothing left to buy: jitter >= escalateMs and jitter <= calmMs now select the same
+// interval, so the policy below is a no-op on the wire. Keeping a ping probe alive to decide a choice that no
+// longer changes anything would cost uplink for nothing.
 //
-// Note what is NOT the signal: how far units move between snapshots. That measured p99 0.15–0.44 tiles on the
-// same four specs — far under the client's 2.5-tile teleport threshold, and the only large step (4.472 tiles)
-// is a skill teleport that measures identically at 20 Hz. Lowering the rate did not make anything jump.
+// What survives, deliberately:
+//   * `parseSnapRate` — SP_SNAP_RATE is the operator's one-step uplink fallback and is still honoured. With one
+//     gear, 'fast' and the default are the same per-role cadence; 'slow' pins EVERY watcher to the idle rate
+//     (fields.js _emit), which is the way back if 20 Hz for drivers proves too expensive on a narrow pipe. It is
+//     a static pin, not the adaptive gear the user retired.
+//   * the measured thresholds and the dwell — re-arming a gear needs no new measurement.
+//   * the RTT probe itself (server/net.js linkProbeMs) — samples are still collected, so a future gear needs no new
+//     wire work. Set linkProbeMs=0 to stop paying for them.
 //
-// So the rate follows the *link*, per connection: SNAPSHOT_EVERY_FAST while the server's own ws ping/pong
-// round trips say the link is jittery enough to need it, SNAPSHOT_EVERY otherwise. The samples come from
-// server/net.js (the server pings; the client's WebSocket implementation answers with no client change), so
-// this needs no protocol change and works for older clients. Jitter here is the mean absolute successive
-// difference of the RTT samples — the same statistic the live deployment shows at ~56 ms on a mobile link.
-//
-// Two brakes keep it honest: a connection whose socket is already queueing (bufferedAmount) is never
-// escalated — more frames would deepen the queue, not help — and a switch must survive `dwellMs` so the two
-// rates cannot flap. Mode is SP_SNAP_RATE=auto (default) | slow | fast; see server/match/match/snapRate.js.
+// Note the m.public path's own congestion fallback (server/lobby.js broadcastPublic) is INDEPENDENT of this module:
+// it reads `ws.bufferedAmount` directly and drops a queued recipient's delta chain. This module never governed it.
 //
 // A pure module: no sockets, no timers. `update()` is fed samples and returns a rate; the caller owns the clock.
 
 import { SNAPSHOT_EVERY, SNAPSHOT_EVERY_FAST } from '../sim/constants.js';
 
-/** The two snapshot intervals, as tick counts (4 = 15 Hz, 3 = 20 Hz at 2× real time). */
+/** The two snapshot intervals, as tick counts. Both are 3 = 20 Hz at 2× real time: the adaptive gear is retired,
+ *  so there is no longer a second, denser rate for the policy to escalate to (see the header). They stay two
+ *  named constants so re-arming a gear later is a one-line change in server/sim/constants.js. */
 export const SNAP_SLOW = SNAPSHOT_EVERY;
 export const SNAP_FAST = SNAPSHOT_EVERY_FAST;
 
 /**
- * Escalate at the jitter where 20 Hz starts to pay: measured at the 10 Hz base, 10 Hz extrapolated 1.5% of frames
- * at 50 ms against 20 Hz's 0.2%. Below `calmMs` both rates measured 0.0%, so a calm link drops back. The base is
- * 15 Hz now, so the threshold is conservative (see the header; recalibration is an open item).
+ * Whether a faster gear exists to escalate to: "fast" must be STRICTLY denser than "slow" (fewer ticks). With the
+ * gear retired the two are equal, so `hasFastGear()` is false and `update()` never moves a connection — the
+ * escalation path stays as it is only so that making SNAPSHOT_EVERY_FAST denser again re-arms it in one edit.
+ */
+export const hasFastGear = () => SNAP_FAST < SNAP_SLOW;
+
+/**
+ * Escalate at the jitter where a denser gear starts to pay: measured at the 10 Hz base, 10 Hz extrapolated 1.5% of
+ * frames at 50 ms against 20 Hz's 0.2%; below `calmMs` both measured 0.0%, so a calm link drops back. Unused while
+ * `hasFastGear()` is false — kept with the rest of the policy so re-arming a gear needs no new measurement.
  */
 export const SNAP_ESCALATE_MS = 50;
 export const SNAP_CALM_MS = 20;
@@ -95,10 +99,10 @@ export function parseSnapRate(v) {
 
 /**
  * Sanity check of the two intervals: both are positive integers and SNAP_SLOW >= SNAP_FAST, i.e. "fast" is at least
- * as dense as "slow". Divisibility is no longer required — each watcher counts the ticks since its own last frame
- * (server/match/fields.js _emit), so a slow watcher on a field that also carries a fast one keeps its own cadence
- * whatever the two intervals are (4 and 3 ticks do not nest, and no longer need to). A configuration that fails
- * this check has no usable fast rate, so the policy pins everyone to the slow one.
+ * as dense as "slow". Equal is legal and is the shipped state — that is the retired gear, where the two name the
+ * same interval. Divisibility is not required: each watcher counts the ticks since its own last frame
+ * (server/match/fields.js _emit), so watchers on different cadences keep their own instead of taking only the ticks
+ * divisible by both (3 and 12 ticks do not nest, and do not need to).
  */
 export const snapRatesCompatible = () =>
   Number.isInteger(SNAP_FAST) && Number.isInteger(SNAP_SLOW) && SNAP_FAST > 0 && SNAP_SLOW >= SNAP_FAST;
@@ -109,15 +113,21 @@ export const snapRatesCompatible = () =>
  */
 export class SnapRate {
   /**
-   * @param {{ escalateMs?: number, calmMs?: number, dwellMs?: number, congestedBytes?: number }} [opts]
+   * @param {{ escalateMs?: number, calmMs?: number, dwellMs?: number, congestedBytes?: number,
+   *           slow?: number, fast?: number }} [opts]
    *   calmMs defaults to the same fraction of escalateMs as the measured pair below (20 / 50), so moving the
    *   threshold keeps the hysteresis band proportional instead of accidentally narrowing it to nothing.
+   *   `slow`/`fast` override the two intervals (tests only): the shipped ones come from the constants, and giving
+   *   them to the instance is what lets a re-armed gear be exercised without changing what production ships.
    */
-  constructor({ escalateMs = SNAP_ESCALATE_MS, calmMs = null, dwellMs = SNAP_DWELL_MS, congestedBytes = SNAP_CONGESTED_BYTES } = {}) {
+  constructor({ escalateMs = SNAP_ESCALATE_MS, calmMs = null, dwellMs = SNAP_DWELL_MS, congestedBytes = SNAP_CONGESTED_BYTES,
+    slow = SNAP_SLOW, fast = SNAP_FAST } = {}) {
     this.escalateMs = escalateMs;
     this.calmMs = calmMs ?? escalateMs * (SNAP_CALM_MS / SNAP_ESCALATE_MS);
     this.dwellMs = dwellMs;
     this.congestedBytes = congestedBytes;
+    this.slow = slow;
+    this.fast = fast;
     /** @type {Map<string, { rate: typeof SNAP_SLOW | typeof SNAP_FAST, changedAt: number, jitter: number | null, changed: boolean }>} */
     this.states = new Map();
   }
@@ -150,8 +160,8 @@ export class SnapRate {
       // The socket is already queueing: the frames are not arriving on time and adding more would deepen the
       // backlog. Drop to the slow rate and do not wait out the dwell — a congested link is bad right now.
       st.jitter = null;
-      if (st.rate !== SNAP_SLOW) {
-        st.rate = SNAP_SLOW;
+      if (st.rate !== this.slow) {
+        st.rate = this.slow;
         st.changedAt = now;
         st.changed = true;
       }
@@ -160,9 +170,12 @@ export class SnapRate {
 
     const jitter = rttJitter(stats.rtts);
     st.jitter = jitter;
+    // The gate is the module constants (one gear shipped). `this.fast < this.slow` covers a policy built with a
+    // denser gear — tests only, so that re-arming a gear is a constants change and nothing else.
+    if (!(this.fast < this.slow) && !hasFastGear()) return st.rate;
     if (jitter == null) return st.rate;
 
-    const want = jitter >= this.escalateMs ? SNAP_FAST : jitter <= this.calmMs ? SNAP_SLOW : null;
+    const want = jitter >= this.escalateMs ? this.fast : jitter <= this.calmMs ? this.slow : null;
     if (want == null || want === st.rate) return st.rate;
     if (now - st.changedAt < this.dwellMs) return st.rate;
     st.rate = want;
@@ -171,15 +184,15 @@ export class SnapRate {
     return st.rate;
   }
 
-  /** @param {string} playerId @returns {typeof SNAP_SLOW | typeof SNAP_FAST} */
+  /** @param {string} playerId @returns {number} */
   rateFor(playerId) {
-    if (!snapRatesCompatible()) return SNAP_SLOW;
-    return this.states.get(playerId)?.rate ?? SNAP_SLOW;
+    if (!snapRatesCompatible()) return this.slow;
+    return this.states.get(playerId)?.rate ?? this.slow;
   }
 
   /** @param {string} playerId */
   isFast(playerId) {
-    return this.rateFor(playerId) === SNAP_FAST;
+    return this.rateFor(playerId) === this.fast && this.fast < this.slow;
   }
 
   /** Whether the last `update()` for this connection changed its rate (the caller logs it). @param {string} playerId */
@@ -192,10 +205,10 @@ export class SnapRate {
     return this.states.get(playerId)?.jitter ?? null;
   }
 
-  /** Connections currently on the fast rate (observability). */
+  /** Connections currently on the fast rate (observability). Zero while there is one gear. */
   fastCount() {
     let n = 0;
-    for (const st of this.states.values()) if (st.rate === SNAP_FAST) n++;
+    for (const st of this.states.values()) if (st.rate === this.fast && this.fast < this.slow) n++;
     return n;
   }
 

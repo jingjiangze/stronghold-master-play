@@ -14,8 +14,16 @@ test('constructor validation mirrors the stub; start() sends the first m.public 
   assert.throws(() => new Match({ seats: [{ seat: 0, playerId: 'a', name: 'a', isBot: false, connected: true }] }), TypeError);
   assert.equal(typeof StubMatch, 'function', 'the platform stub is kept for platform tests');
   const h = makeMatch({ mode: 'coop', humans: 2, bots: 1, seed: 60 }).start();
-  const pub = h.lastBc('m.public');
+  // A human gets a BASELINE first (the full view, `full: true`); the broadcast on the wire is the compact hot frame
+  // whose per-match constants live only in that baseline (server/match/match/views.js).
+  const pub = h.sent.map(([, m]) => m).find((m) => m.t === 'm.public' && m.full === true);
+  assert.ok(pub, 'every human seat is sent a baseline');
   for (const k of ['phase', 'round', 'lastRound', 'deadline', 'serverNow', 'modeId', 'difficulty', 'stageId', 'factions', 'disabledBonds', 'bannedChess', 'bossId', 'players', 'fields']) assert.ok(k in pub, `m.public.${k}`);
+  const hot = h.lastBc('m.public');
+  assert.equal(hot.full, undefined, 'the hot frame is not a baseline');
+  for (const k of ['lastRound', 'modeId', 'difficulty', 'stageId', 'factions', 'disabledBonds', 'bannedChess', 'bossId']) {
+    assert.equal(k in hot, false, `the hot frame drops the constant m.public.${k}`);
+  }
   assert.equal(pub.phase, PHASE.INFO_CHECK);
   assert.equal(pub.lastRound, 14);
   assert.ok(DATA.stages[pub.stageId]);

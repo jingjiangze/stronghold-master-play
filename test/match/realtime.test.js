@@ -195,8 +195,12 @@ test('real-time co-op over websockets with the real simulation: 2 humans + 2 AI 
     assert.ok(s.buys >= 3 && s.placed >= 3 && s.readies >= 3, `${c.id} played its preps: ${JSON.stringify(s)}`);
     // the SP round (NORMAL R3) gave every alive player a card
     assert.equal(s.cards, 1, `${c.id} picked one 机变 card`);
-    const pubs = c.log.filter((x) => x.t === 'm.public');
-    const phases = new Set(pubs.map((x) => x.phase));
+    // The BASELINE (full: true, the constants carrier) is sent once per join/resync and is not part of the throttled
+    // stream, so the cadence below is asserted over the compact hot frames only (server/match/match/views.js). The
+    // phase set still counts every frame — a short presentation phase may arrive in a baseline alone.
+    const allPubs = c.log.filter((x) => x.t === 'm.public');
+    const pubs = allPubs.filter((x) => x.full !== true);
+    const phases = new Set(allPubs.map((x) => x.phase));
     // (sub-100 ms presentation phases at this timer scale may fall between two throttled m.public frames)
     for (const ph of ['INFO_CHECK', 'BAND_DRAFT', 'SP_DRAFT', 'PREP', 'COMBAT']) assert.ok(phases.has(ph), `${c.id} saw ${ph}`);
     // m.public: throttled to ≤ 10/s (a 100 ms gap, small timer jitter tolerated)

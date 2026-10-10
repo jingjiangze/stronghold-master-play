@@ -37,12 +37,11 @@ import { html, UiHosts, Button, MicroLabel, closeAllDialogs } from './ui/compone
 import { ConnectionBanner } from './ui/connBanner.js';
 import { ToastHost, toast, toastError, describeError } from './ui/toasts.js';
 import { net, identity, NetError } from './net.js';
-import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating, pushChatMessage, clearChat } from './store.js';
+import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating } from './store.js';
 import { data } from './data.js';
 import { GAME_FILES } from './ui/gameComponents.js';
 import { TitleScreen, sanitizeName } from './screens/title.js';
 import { LobbyScreen, rememberRoom, parseRoomParam } from './screens/lobby.js';
-import { XieRoomScreen } from './screens/xieRoom.js';
 import { RoomScreen } from './screens/room.js';
 import { GameScreen } from './screens/game.js';
 import { installAudio } from './audio.js';
@@ -63,7 +62,7 @@ const JOIN_DELAY_MS = 350;
 const TICKER_KEEP = 20;
 const EMOTE_KEEP = 20;
 
-const SCREENS = { title: TitleScreen, lobby: LobbyScreen, xie: XieRoomScreen, room: RoomScreen, game: GameScreen };
+const SCREENS = { title: TitleScreen, lobby: LobbyScreen, room: RoomScreen, game: GameScreen };
 
 /** Copy of a server message without transport fields. */
 function payload(msg) {
@@ -81,9 +80,6 @@ function payload(msg) {
 function mergePublic(prev, next) {
   const out = { ...prev };
   for (const [k, v] of Object.entries(next)) {
-    // `seq` belongs to the delta chain's TRANSPORT, not to the match state: it says which frame this was, and keeping
-    // it would make the mirror carry a key publicView() never publishes.
-    if (k === 'seq') continue;
     if (k === 'players' && Array.isArray(v) && Array.isArray(prev.players)) out.players = mergePlayers(prev.players, v);
     else out[k] = v;
   }
@@ -118,12 +114,6 @@ let seq = 0;
 let welcomeAt = 0;
 let roomStateAt = 0;
 let matchAt = 0;
-/**
- * The delta chain's bookkeeping for gap detection (compression round 2, step ④): `last` is the newest `seq` merged
- * into the mirror, `asked` the seq of the gap already reported (so one long gap is reported once, not once per frame).
- * Reset whenever the mirror starts over — a baseline, a new match, a return to the lobby.
- */
-const pubSeq = { last: null, asked: null };
 let restoreTimer = null;
 let joinTimer = null;
 let joinInFlight = false;
@@ -180,8 +170,6 @@ function backToLobby() {
   if (s.room || s.match.public) closeAllDialogs();
   store.set({ room: null, match: emptyMatch(), ticker: [], emotes: [] });
   store.patch('ui', { restoring: false });
-  pubSeq.last = null;
-  pubSeq.asked = null;
 }
 
 function onWelcome(msg) {
@@ -228,8 +216,6 @@ function onRoomState(msg) {
   const prevRoom = store.get().room;
   // A (new) match starts: forget the previous match's state so stale results never show.
   if (room.inMatch && !(prevRoom && prevRoom.inMatch && prevRoom.code === room.code)) store.set({ match: emptyMatch() });
-  // A different room: the previous room's chat log must not sit under the new room's lines.
-  if (!prevRoom || prevRoom.code !== room.code) clearChat();
   store.set({ room });
   if (room.mode === 'coop' && typeof room.code === 'string') rememberRoom(room.code);
   maybeFinishRestore();
@@ -257,13 +243,8 @@ function wireNet() {
   net.on('replaced', () => toast(t('该身份已在其他页面登录，本页已断开'), 'warn', { ttl: 6000 }));
   net.on('unhandledError', (err) => toastError(err));
   net.on('room.state', onRoomState);
-  // 快速匹配 (server/matchmaking.js): the queue's own state — idle / queued / offered / matched
-  net.on('queue.state', (msg) => store.patch('lobby', { queue: payload(msg) }));
-  // 房间与局内文字聊天: the server broadcasts every line to the room (players and spectators alike)
-  net.on('room.chat', (msg) => pushChatMessage(msg));
   net.on('room.closed', (msg) => {
     backToLobby();
-    clearChat();
     const known = Object.hasOwn(CLOSE_REASON, String(msg.reason)) ? CLOSE_REASON[msg.reason] : null;
     toast(known ? t(known) : typeof msg.reason === 'string' && msg.reason.length < 60 ? t('同盟已关闭：{reason}', { reason: msg.reason }) : t('同盟已关闭'), 'warn');
   });
@@ -277,26 +258,7 @@ function wireNet() {
       // Every other frame is merged into the mirror — the per-match constants travel only in the baseline, so a
       // compact hot frame must not erase them (server/match/match/views.js; the `pub: 1` hello capability). Delta
       // frames (pubDelta) merge players[] per player with an explicit null for a cleared key (mergePublic).
-      const merged = baseline === true || !prev ? next : mergePublic(prev, next);
-      // Gap detection (step ④): every frame of a delta chain carries `seq`, counting up per recipient. A frame that
-      // never arrived is invisible by itself — without this check its deltas would be merged against a baseline that
-      // lacks everything that frame held, and the mirror would silently stay wrong until the periodic anchor. So a
-      // gap asks for a resync instead: the server drops the chain, the next hot frame is complete, recovery costs one
-      // frame rather than up to 30 s of wrong state. Asked once per gap (never on every frame of a long one).
-      if (!net || baseline !== true) {
-        const seq = Number.isInteger(next.seq) ? next.seq : null;
-        const prevSeq = pubSeq.last;
-        if (seq !== null && prevSeq !== null && seq > prevSeq + 1 && seq !== pubSeq.asked) {
-          pubSeq.asked = seq;
-          try { net.request('g.resync').catch?.(() => {}); } catch { /* the resync is best-effort */ }
-        }
-        if (seq !== null) pubSeq.last = seq;
-      } else {
-        // a baseline starts a new chain: any number we were tracking belongs to the one before it
-        pubSeq.last = null;
-        pubSeq.asked = null;
-      }
-      return { public: merged };
+      return { public: baseline === true || !prev ? next : mergePublic(prev, next) };
     });
     maybeFinishRestore();
   });

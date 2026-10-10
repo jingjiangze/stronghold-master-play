@@ -1,14 +1,16 @@
-// server/match/match/snapRate.js — Match methods: the adaptive battle-snapshot rate (DESIGN §4, §8.2).
+// server/match/match/snapRate.js — Match methods: the battle-snapshot rate (DESIGN §4, §8.2).
 //
-// The policy is a pure module (server/match/snapRate.js); this is the wiring — who is on the fast rate right
-// now, and whether a given watcher takes the fast one.
+// The policy is a pure module (server/match/snapRate.js); this is the wiring.
 //
-// The rate is per *connection*, because a link is per connection: one jittery watcher must not double the uplink
-// of a field whose other watchers are on quiet links. Each watcher carries its own elapsed-tick counter, so the
-// field can serve both cadences at once (server/match/fields.js _emit): a watcher on the fast rate takes a frame
-// every SNAPSHOT_EVERY_FAST ticks, a slow watcher every SNAPSHOT_EVERY — 20 Hz and 15 Hz at 2× — and the two do
-// not need to nest. Events drained on a skipped tick are held for that watcher and delivered with its next
-// snapshot, so a skipped frame never drops a state-carrying `b.ev`.
+// The adaptive gear is RETIRED (2026-10-11): there is one rate per ROLE — SNAPSHOT_EVERY (3 ticks, 20 Hz at 2×)
+// for a field's own players, SNAPSHOT_EVERY_IDLE (12 ticks, 5 Hz) for anyone who merely watches — and the emit site
+// picks it from whether the watcher drives the field (server/match/fields.js _emit). It no longer asks this module
+// for a per-link upgrade, so `snapIsFast()` is kept only for observability and to keep SP_SNAP_RATE=fast meaningful.
+//
+// What the per-connection policy still does: the CONGESTION brake. A socket that is already queueing is never
+// given a denser cadence — more frames would deepen the backlog, not help. That half was always the more valuable
+// one and it is what the m.public path uses (server/lobby.js). Link samples are still collected
+// (server/net.js linkProbeMs; 0 stops paying for them) so an adaptive gear can be re-armed without new wire work.
 //
 // Installed on Match.prototype by server/match/Match.js (a method container: never instantiated; `this` is the match).
 
@@ -29,7 +31,10 @@ export class MatchSnapRate {
   /**
    * Re-read every watched connection's link samples and settle its snapshot rate. Throttled to
    * SNAP_RATE_REFRESH_MS of match time. A match with no link source (tests, a host that passes none) keeps the
-   * slow rate everywhere and never enters here.
+   * base rate everywhere and never enters here.
+   *
+   * With the gear retired the policy cannot move a connection (there is nothing denser to move it to), so this now
+   * only refreshes the jitter reading and the congestion state — both still observed and still logged on change.
    */
   refreshSnapRates() {
     if (!this.linkOf) return;
@@ -52,10 +57,11 @@ export class MatchSnapRate {
   }
 
   /**
-   * The finest snapshot interval (ticks) this field needs right now: the fast one as soon as any of its watchers is
-   * on the fast rate, else the slow one. Observability only — the wire path asks `snapIsFast(pid)` per watcher
-   * (fields.js _emit): each watcher counts its own ticks, so the field serves both cadences at once and no field-wide
-   * grid exists any more. `SP_SNAP_RATE` pins it — 'slow' never escalates, 'fast' always does.
+   * The snapshot interval (ticks) this field's own players get right now. Observability only: the wire path no
+   * longer consults it, because the emit site picks the cadence per watcher from whether that watcher drives the
+   * field (fields.js _emit) — a field serves its players 20 Hz and its watchers 5 Hz at once, so no single
+   * field-wide interval describes it any more. `SP_SNAP_RATE` still pins what it can: 'fast' names the dense
+   * interval, 'slow' the base one.
    * @param {string} fieldId
    * @returns {number}
    */

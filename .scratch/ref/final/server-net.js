@@ -41,7 +41,6 @@ import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { C2S, validateC2S } from '../shared/protocol.js';
 import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION } from '../shared/constants.js';
-import { isCompressibleType } from './wsCompression.js';
 
 /** Tunables (all overridable through the Network / SessionRegistry constructors). */
 export const NET_DEFAULTS = Object.freeze({
@@ -58,9 +57,7 @@ export const NET_DEFAULTS = Object.freeze({
   maxSessions: 20_000,          // registry cap; oldest idle sessions are evicted first
   heavyPerSec: 2,               // refill of the bucket for resend-heavy intents (HEAVY_TYPES)
   heavyBurst: 6,
-  trustProxy: 'auto',           // forwarding headers: 'auto' from loopback/private peers only, true = always, false = never
-  linkProbeMs: 2_000,           // ws ping/pong link probe while a socket is being streamed to; 0 disables it
-  linkWarmMs: 10_000,           // a socket counts as "streamed to" this long after its last droppable frame
+  trustProxy: 'auto',           // forwarding headers: 'auto' = from loopback/private peers only, true = always, false = never
 });
 
 /**
@@ -291,20 +288,16 @@ const onSendDone = (err) => { void err; }; // errors surface through the socket'
  * congested (> 1 MB queued), and terminates sockets whose queue exceeds 16 MB.
  * @param {import('ws').WebSocket | null | undefined} ws
  * @param {string} data
- * @param {{ droppable?: boolean, compress?: boolean }} [opts] compress: ask permessage-deflate to compress this
- *   frame (a no-op when the connection did not negotiate it, see server/wsCompression.js)
+ * @param {{ droppable?: boolean }} [opts]
  * @returns {boolean} true when the frame was queued
  */
-export function sendRaw(ws, data, { droppable = false, compress = false } = {}) {
+export function sendRaw(ws, data, { droppable = false } = {}) {
   if (!ws || ws.readyState !== WS_OPEN || typeof data !== 'string') return false;
   try {
     const queued = ws.bufferedAmount;
     if (queued > NET_DEFAULTS.hardBufferBytes) { ws.terminate(); return false; }
     if (droppable && queued > NET_DEFAULTS.snapDropBytes) return false;
-    // A droppable frame is a battle snapshot: this socket is being streamed to, so the link probe should run
-    // (Network.probeLinks) until it goes quiet for linkWarmMs.
-    if (droppable) linkState(ws).lastSnapAt = Date.now();
-    ws.send(data, { compress: compress === true }, onSendDone);
+    ws.send(data, onSendDone);
     return true;
   } catch {
     return false;
@@ -315,63 +308,6 @@ export function sendRaw(ws, data, { droppable = false, compress = false } = {}) 
 export const isDroppable = (msg) => !!msg && msg.t === 'b.snap';
 
 /**
- * Per-socket link state for the adaptive snapshot rate (server/match/snapRate.js): the round-trip times of the
- * ws ping/pong probe, and when the socket last received a battle frame — the probe only runs while a socket is
- * actually being streamed to, so an idle lobby connection costs nothing.
- *
- * The probe is a ws-level ping, which the client's WebSocket implementation answers by itself (RFC 6455: the
- * pong echoes the ping's payload), so no client change and no protocol change are involved. The heartbeat's
- * payload-less ping is ignored here — it measures liveness, not the link.
- */
-const LINK = new WeakMap();
-/** RTT samples kept per socket: enough to smooth jitter without lagging behind a link that just changed. */
-const LINK_RTT_KEEP = 8;
-/** A sample older than this is not a plausible round trip (a stalled socket, a clock step). */
-const LINK_MAX_RTT_MS = 60_000;
-
-/** @param {import('ws').WebSocket} ws */
-function linkState(ws) {
-  let st = LINK.get(ws);
-  if (!st) {
-    st = { rtts: [], probeSent: 0, lastSnapAt: 0 };
-    LINK.set(ws, st);
-  }
-  return st;
-}
-
-/**
- * The link samples of a socket, for the match's snapshot-rate policy. `rtts` is the live ring (oldest → newest):
- * read it, do not keep or mutate it. `null` for a socket that never carried a battle frame.
- * @param {import('ws').WebSocket | null | undefined} ws
- * @returns {{ rtts: readonly number[], buffered: number } | null}
- */
-export function linkQualityOf(ws) {
-  const st = ws ? LINK.get(ws) : null;
-  if (!st) return null;
-  return { rtts: st.rtts, buffered: Number(ws.bufferedAmount) || 0 };
-}
-
-/**
- * Record a link-probe pong: the payload is the ms timestamp the probe was sent with (Network.probeLinks), so the
- * round trip is `now - sent`. A payload-less pong is the liveness heartbeat and carries no timing — ignored.
- * @param {import('ws').WebSocket} ws
- * @param {Buffer | ArrayBuffer | Buffer[]} data the pong payload
- * @param {number} now
- */
-export function recordLinkPong(ws, data, now) {
-  const st = LINK.get(ws);
-  if (!st) return;
-  const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8') : Buffer.from(data).toString('utf8');
-  if (!text) return; // the liveness heartbeat's payload-less ping: no timing to read
-  const sent = Number(text);
-  if (!Number.isFinite(sent)) return;
-  const rtt = now - sent;
-  if (!(rtt >= 0) || rtt > LINK_MAX_RTT_MS) return;
-  st.rtts.push(rtt);
-  if (st.rtts.length > LINK_RTT_KEEP) st.rtts.shift();
-}
-
-/**
  * Encode and send one message to a socket. Never throws.
  * @param {import('ws').WebSocket | null | undefined} ws
  * @param {object} msg
@@ -380,7 +316,7 @@ export function recordLinkPong(ws, data, now) {
 export function send(ws, msg) {
   const data = encode(msg);
   if (data == null) return false;
-  return sendRaw(ws, data, { droppable: isDroppable(msg), compress: isCompressibleType(msg?.t) });
+  return sendRaw(ws, data, { droppable: isDroppable(msg) });
 }
 
 /**
@@ -611,40 +547,6 @@ export class Network {
     const sweepMs = Math.max(20, Math.min(15_000, Math.floor(this.opts.reconnectWindowMs / 4)));
     this.sweepTimer = setInterval(() => this.sweep(), sweepMs);
     this.sweepTimer.unref?.();
-    // Link probe for the adaptive snapshot rate (server/match/snapRate.js): ping the sockets being streamed to,
-    // so the match can tell a jittery link from a quiet one. linkProbeMs = 0 turns it off.
-    if (this.opts.linkProbeMs > 0) {
-      this.linkTimer = setInterval(() => this.probeLinks(), this.opts.linkProbeMs);
-      this.linkTimer.unref?.();
-    }
-  }
-
-  /**
-   * Ping the sockets whose link can decide something, timestamped so the pong yields a round trip
-   * (recordLinkPong). The client's WebSocket implementation answers a ping by itself, so this needs nothing from
-   * the client and works with any version of it.
-   *
-   * Two populations are probed, and nothing else: a socket being streamed to (it may be watching a battle right
-   * now), and one sitting in a room (it is about to — probing during prep means the first combat frame already
-   * has a verdict instead of waiting for samples). An idle lobby connection's link decides nothing and must not
-   * cost uplink.
-   */
-  probeLinks() {
-    const now = this.now();
-    for (const conn of this.conns.values()) {
-      try {
-        if (conn.closing || conn.ws.readyState !== WS_OPEN) continue;
-        const st = LINK.get(conn.ws);
-        if (!st) continue;
-        const streaming = now - st.lastSnapAt <= this.opts.linkWarmMs;
-        if (!streaming && !(conn.session && conn.session.roomCode)) continue;
-        if (now - st.probeSent < this.opts.linkProbeMs) continue;
-        st.probeSent = now;
-        conn.ws.ping(String(now));
-      } catch (e) {
-        this.log.debug?.('[net] link probe error', e?.message);
-      }
-    }
   }
 
   /** Number of open sockets. */
@@ -673,17 +575,11 @@ export class Network {
     if (this.closed) { try { ws.close(CLOSE.SHUTDOWN, 'server shutdown'); } catch { /* ignore */ } return; }
     const conn = new Connection(ws, clientAddress(req, this.opts.trustProxy), this.now(), this.opts);
     this.conns.set(ws, conn);
-    linkState(ws);   // the link probe's per-socket ring (probeLinks / linkQualityOf)
     if (conn.key) this.connsPerKey.set(conn.key, (this.connsPerKey.get(conn.key) || 0) + 1);
     ws.on('message', (data, isBinary) => {
       try { this.onFrame(conn, data, isBinary); } catch (e) { this.log.error('[net] frame handler crashed', e); }
     });
-    ws.on('pong', (data) => {
-      conn.alive = true;
-      if (conn.session && conn.session.ws === ws) conn.session.lastSeen = this.now();
-      // A link-probe pong (Network.probeLinks sent a timestamp payload); the liveness ping carries none.
-      try { recordLinkPong(ws, data, this.now()); } catch { /* a malformed payload is simply not a sample */ }
-    });
+    ws.on('pong', () => { conn.alive = true; if (conn.session && conn.session.ws === ws) conn.session.lastSeen = this.now(); });
     ws.on('error', (e) => { this.log.debug?.('[net] socket error', e?.code || e?.message); });
     ws.on('close', () => { try { this.onClose(conn); } catch (e) { this.log.error('[net] close handler crashed', e); } });
   }
@@ -870,7 +766,6 @@ export class Network {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.heartbeatTimer);
-    if (this.linkTimer) clearInterval(this.linkTimer);
     clearInterval(this.sweepTimer);
     for (const conn of this.conns.values()) {
       conn.close(code, reason);

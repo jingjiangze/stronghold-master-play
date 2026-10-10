@@ -1,0 +1,31 @@
+
+== a. compact frames (pub: 1, today)
+   match: end R? · virtual steps 165 · m.public frames 520
+   seat p_0: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1683986 B
+   seat p_1: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1662535 B
+   seat p_2: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1747472 B
+   seat p_3: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1792330 B
+   by type (all seats): b.ev 1822.4K · b.snap 2802.4K · m.field 7.7K · m.private 2026.4K · m.public 2387.2K · m.result 33.1K · m.ticker 26.3K · m.toast 2.8K · room.state 3.9K
+
+== b. after ③ (pubBonds)
+   match: end R? · virtual steps 165 · m.public frames 520
+   seat p_0: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1683986 B
+   seat p_1: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1662535 B
+   seat p_2: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1747472 B
+   seat p_3: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1792330 B
+   by type (all seats): b.ev 1822.4K · b.snap 2802.4K · m.field 7.7K · m.private 2026.4K · m.public 2387.2K · m.result 33.1K · m.ticker 26.3K · m.toast 2.8K · room.state 3.9K
+
+== c. after ③+④ (pubDelta, SP_PUB_SYNC=delta)
+   match: end R? · virtual steps 165 · m.public frames 520
+   seat p_0: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1683986 B
+   seat p_1: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1662535 B
+   seat p_2: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1747472 B
+   seat p_3: m.public raw 611129 B (596.8 KiB) · deflate 120764 B · frames 130 (baseline 0/0 B, hot 130/611129 B) · other raw 1792330 B
+   by type (all seats): b.ev 1822.4K · b.snap 2802.4K · m.field 7.7K · m.private 2026.4K · m.public 2387.2K · m.result 33.1K · m.ticker 26.3K · m.toast 2.8K · room.state 3.9K
+
+== capable seat p_1 per match (every m.public frame)
+   raw JSON:      a 611129 B · b 611129 B · c 611129 B
+   deflated:      a 120764 B · b 120764 B · c 120764 B  (permessage-deflate, serverNoContextTakeover)
+   raw  b/a = 1.000 (③ saves 0.0%) · c/a = 1.000 (③+④ saves 0.0%) · a/c = 1.00× · ④ on ③: 1.00×
+   defl b/a = 1.000 (③ saves 0.0%) · c/a = 1.000 (③+④ saves 0.0%) · a/c = 1.00× · ④ on ③: 1.00×
+   silent seat p_0 (unchanged by either step): raw a 611129 B · b 611129 B · c 611129 B (all deflated totals equal: true)

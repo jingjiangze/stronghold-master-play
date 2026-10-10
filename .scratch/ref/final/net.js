@@ -37,12 +37,6 @@ export const REQUEST_TIMEOUT_MS = 8000;
 export const HELLO_TIMEOUT_MS = 8000;
 export const PING_INTERVAL_MS = 4000;
 export const DEAD_AFTER_MS = 15000;
-/** A probe still unanswered after this long is dropped, and its RTT is never reported. */
-export const PING_TIMEOUT_MS = DEAD_AFTER_MS;
-/** A reading older than this stops being shown: the number would describe a link that may be gone. */
-export const PING_SAMPLE_MAX_AGE_MS = PING_INTERVAL_MS * 3;
-/** Upper bound on probes in flight, so a stalled socket cannot grow the map without limit. */
-const MAX_PENDING_PINGS = 8;
 export const BACKOFF = Object.freeze({ base: 500, factor: 2, max: 10000, jitter: 0.2 });
 
 /** Client-side error codes (in addition to shared ERR codes). */
@@ -120,9 +114,7 @@ export class Net {
    * @param {string} [opts.url] socket URL (default: derived from location at connect time)
    * @param {any} [opts.WebSocket] WebSocket constructor (default: globalThis.WebSocket)
    * @param {() => (string|null)} [opts.getToken] reconnect-token provider for `hello`
-   * @param {() => number} [opts.now] epoch clock (what the wire carries, and the base of the server-time estimate)
-   * @param {() => number} [opts.monotonicNow] elapsed-time clock for RTT (defaults to `opts.now` for injected clocks)
-   * @param {() => boolean} [opts.isVisible] whether latency probes belong to a visible page
+   * @param {() => number} [opts.now]
    * @param {() => number} [opts.random]
    * @param {{setTimeout: Function, clearTimeout: Function, setInterval: Function, clearInterval: Function}} [opts.timers]
    */
@@ -131,11 +123,6 @@ export class Net {
     this.WS = opts.WebSocket || null;
     this.getToken = typeof opts.getToken === 'function' ? opts.getToken : () => null;
     this.now = opts.now || (() => Date.now());
-    // RTT is measured on an elapsed-time clock: an NTP correction or a manual clock change mid-probe must not turn a
-    // 40 ms link into a negative or a 30-minute reading (the epoch clock is still what the wire carries).
-    this.monotonicNow = opts.monotonicNow || opts.now || (() => performance.now());
-    // A hidden tab still heartbeats, but its probes say nothing about the link the player will feel when they return.
-    this.isVisible = opts.isVisible || (() => typeof document === 'undefined' || document.visibilityState !== 'hidden');
     this.random = opts.random || Math.random;
     this.timers = opts.timers || {
       setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
@@ -171,13 +158,8 @@ export class Net {
     this._helloRid = null;
     this._helloSentName = null;
     this._lastRx = 0;
-    this._unansweredSince = null; // monotonic time of the oldest ping sent since the last inbound frame
+    this._unansweredSince = null; // time of the oldest ping sent since the last inbound frame
     this._clockSamples = [];   // [{ offset, rtt }]
-    this._pings = new Map();   // rid -> { c: epoch time on the wire, at: monotonic time, order }
-    this._pingOrder = 0;       // probe sequence: a reply that overtakes a newer probe must not overwrite it
-    this._lastPongOrder = 0;
-    this._pingReceivedAt = null; // monotonic time of the reading currently on screen
-    this._clockEpoch = this.now() - this.monotonicNow(); // epoch↔monotonic offset, watched for mid-session jumps
   }
 
   // ---- events ----------------------------------------------------------------------------------
@@ -361,9 +343,6 @@ export class Net {
       ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
     }
     this.ws = null;
-    this._resetLatency();
-    this._clockSamples = [];
-    this.clockSynced = false;
     this._unansweredSince = null;
     this._clearTimer('_pingTimer', 'clearInterval');
     this._clearTimer('_helloTimer', 'clearTimeout');
@@ -600,10 +579,8 @@ export class Net {
   _heartbeat() {
     const ws = this.ws;
     if (!ws || ws.readyState !== WS_OPEN) return;
-    const now = this.monotonicNow();
-    this._expireLatency(now);
     const live = this.status === 'online' || this.status === 'connected';
-    if (live && this._unansweredSince != null && now - this._unansweredSince > DEAD_AFTER_MS) {
+    if (live && this._unansweredSince != null && this.now() - this._unansweredSince > DEAD_AFTER_MS) {
       console.warn('[net] connection silent; reconnecting');
       this._teardownSocket();
       try { ws.close(4000, 'heartbeat timeout'); } catch { /* ignore */ }
@@ -614,37 +591,10 @@ export class Net {
     this._sendPing();
   }
 
-  /** Drop the reading on screen (and tell the UI) — a number measured on a link that is gone is worse than none. */
-  _resetLatency(notify = false) {
-    this._pings.clear();
-    this._lastPongOrder = 0;
-    this._pingReceivedAt = null;
-    this.ping = null;
-    if (notify) {
-      this._emit('ping', null);
-      this._emit('status', this.snapshot());
-    }
-  }
-
-  /** Probes past their deadline, and a reading older than the sample window, stop counting. */
-  _expireLatency(now) {
-    for (const [rid, probe] of this._pings) {
-      if (now - probe.at >= PING_TIMEOUT_MS) this._pings.delete(rid);
-    }
-    if (this._pingReceivedAt != null && now - this._pingReceivedAt >= PING_SAMPLE_MAX_AGE_MS) {
-      this._resetLatency(true);
-    }
-  }
-
   _sendPing() {
     if (this.status !== 'online' && this.status !== 'connected') return;
-    const at = this.monotonicNow(), c = this.now(), rid = this._nextRid();
-    this._expireLatency(at);
-    // Hidden pages still heartbeat, but cannot produce a fresh visible latency measurement.
-    if (this.isVisible()) this._pings.set(rid, { c, at, order: ++this._pingOrder });
-    while (this._pings.size > MAX_PENDING_PINGS) this._pings.delete(this._pings.keys().next().value);
-    if (!this._sendRaw({ t: 'ping', rid, c })) { this._pings.delete(rid); return; }
-    if (this._unansweredSince == null) this._unansweredSince = at;
+    const now = this.now();
+    if (this._sendRaw({ t: 'ping', c: now }) && this._unansweredSince == null) this._unansweredSince = now;
   }
 
   /** Force an immediate latency probe (e.g. when the tab regains focus). */
@@ -653,22 +603,13 @@ export class Net {
   }
 
   _onPong(msg) {
-    const probe = this._pings.get(msg.rid);
-    if (!probe || msg.c !== probe.c) return;
-    this._pings.delete(msg.rid);
-    const at = this.monotonicNow(), rtt = at - probe.at;
-    if (!this.isVisible() || !(rtt >= 0 && rtt < PING_TIMEOUT_MS) || probe.order <= this._lastPongOrder) return;
-    this._lastPongOrder = probe.order;
-    this._pingReceivedAt = at;
-    this.ping = Math.round(rtt);
     const now = this.now();
-    if (Number.isFinite(msg.s)) {
-      // A clock adjustment during or between probes invalidates every sample taken before it.
-      const epoch = now - at;
-      if (Math.abs(epoch - this._clockEpoch) > 100) { this._clockSamples = []; this.clockSynced = false; }
-      this._clockEpoch = epoch;
-      this._addClockSample(msg.s + rtt / 2 - now, rtt);
-    }
+    const c = Number(msg.c);
+    if (!Number.isFinite(c)) return;
+    const rtt = now - c;
+    if (!(rtt >= 0 && rtt < 60000)) return;
+    this.ping = Math.round(rtt);
+    if (Number.isFinite(msg.s)) this._addClockSample(msg.s + rtt / 2 - now, rtt);
     this._emit('ping', this.ping);
     this._emit('status', this.snapshot());
   }

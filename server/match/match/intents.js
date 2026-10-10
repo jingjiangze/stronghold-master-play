@@ -51,6 +51,12 @@ export class MatchIntents {
       case 'g.emote': return this.emote(ps, msg.id);
       // playerId: the player tapped (a shared field names two) — the watch preference (item 56)
       case 'g.watch': return this.watch(ps, msg.fieldId, msg.playerId ?? null);
+      // the bonds of a player whose list this connection's hot frames strip (compression round 2, step ③)
+      case 'g.bonds': return this.sendBonds(ps, msg.playerId);
+      // m.public resync (step ④): the client's delta chain got out of step (a gap in the `seq` numbers, or no usable
+      // baseline) — drop its chain so the next hot frame it gets is a complete one, one frame from now instead of at
+      // the periodic anchor. Always OK even when this match is not using deltas: there is nothing to reset then.
+      case 'g.resync': this.resetPublicDelta(ps.playerId); return OK;
       case 'g.autoplay': return this.setAutoplay(ps, !!msg.on);
       case 'g.pause': return this.setPause(ps, !!msg.on);
       // the stats the board's units start their next battle with (the detail card in prep, user playtest #4 item 7)

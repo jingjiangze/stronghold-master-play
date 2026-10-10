@@ -162,7 +162,9 @@ test('per-match disabled bonds: 3 core + 4 add-on (NORMAL+), FUNNY static + 0 + 
 
 test('the match pool excludes banned chess; m.public lists disabled bonds and banned chess', () => {
   const h = makeMatch({ mode: 'coop', difficulty: 'HARD', humans: 1, bots: 1, seed: 3 }).start();
-  const pub = h.lastBc('m.public');
+  // The per-match constants (drawnDisabledBonds / bannedChess) travel in the BASELINE, not in the compact hot frame
+  // (server/match/match/views.js) — read the baseline the seat was sent.
+  const pub = h.sent.map(([, m]) => m).find((m) => m.t === 'm.public' && m.full === true) || h.lastBc('m.public');
   assert.equal(pub.drawnDisabledBonds.length, 7);
   assert.ok(pub.bannedChess.length > 0);
   for (const id of pub.bannedChess) assert.ok(!h.m.pool.has(id), `${id} should not be in the pool`);

@@ -378,7 +378,21 @@ const target = (v) => {
 /** @type {Record<string, Record<string, (v:any)=>boolean> & { $optional?: string[] }>} */
 export const C2S = {
   // session & lobby
-  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), $optional: ['token', 'version'] },
+  // `pub`: the m.public shape this client understands (server/match/match/views.js publicView). 1 = it merges a
+  // compact/incremental frame into its local mirror and honours `full`, so the server may drop the per-match constant
+  // fields from the hot broadcast. Absent (old client, third-party client) ⇒ full frame every time, exactly as before.
+  // `pubBonds` (WS compression round 2, step ③): the client can take a hot frame whose `players[].bonds` only carry the
+  // players its screen can show, and refreshes a player it has no live list for with one `g.bonds` ⇄ `m.bonds` round trip.
+  // `pubDelta` (step ④): the client merges a DELTA hot frame — a top-level key / a `players[]` entry travels only when it
+  // changed since the previous frame this client got, a cleared key travels as an explicit null, and a periodic full
+  // anchor heals a frame the client missed. Absent `pubBonds` / `pubDelta` ⇒ exactly the frames of `pub` alone.
+  // Additive optional fields on purpose: PROTOCOL_VERSION stays strictly checked (server/net.js).
+  hello: {
+    name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64),
+    version: (v) => v == null || isInt(v, 0, 1e6), pub: (v) => v == null || isInt(v, 0, 100),
+    pubBonds: (v) => v == null || isInt(v, 0, 100), pubDelta: (v) => v == null || isInt(v, 0, 100),
+    $optional: ['token', 'version', 'pub', 'pubBonds', 'pubDelta'],
+  },
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
   // variant: a rule-set variant of a multi room, `mode_<variant>_<difficulty>` (e.g. 'xie' = 协同共竞, the borrowing
   // mode); absent ⇒ the plain mode_multi_* (DESIGN §25/§26)
@@ -441,6 +455,15 @@ export const C2S = {
   // playerId: the player tapped in the team panel (a 联防 / boss pair field shows two) — what an eliminated viewer or a
   // spectator seat follows from then on (Match.watchPref; community report of 2026-10-06, item 56)
   'g.watch': { fieldId: (v) => isStr(v, 32), playerId: isId, $optional: ['playerId'] },
+  // the bonds of a player whose list the requester's hot frames do not carry (WS compression round 2, step ③: an
+  // off-screen player, `players[].bonds` stripped) — answered with ONE m.bonds { playerId, bonds } to the requester.
+  // Sent by clients that declared `hello.pubBonds`; the lobby refuses it from a session that did not (server/lobby.js).
+  'g.bonds': { playerId: isId },
+  // m.public resync (WS compression round 2, step ④): the delta chain carries `seq`, and a client whose mirror is out
+  // of step — a gap in those numbers, or no usable baseline after a reconnect — asks HERE instead of waiting for the
+  // periodic full anchor. The server drops that recipient's chain (Match.resetPublicDelta), so its next hot frame is a
+  // complete one. No-op in the 'full' sync mode. Note `g.bonds` above already has this shape's cousin.
+  'g.resync': {},
   'g.autoplay': { on: isBool },
   // solo pause (official PauseUp / ResumeUp, DESIGN §14): freezes the running battle (field clock, deadlines, the
   // browser's local runner) — solo matches only (co-op ⇒ WRONG_PHASE), only while a battle runs; m.public.paused
@@ -504,6 +527,8 @@ export const S2C = [
   // 协同经济 (DESIGN §28) rides the EXISTING frames: m.public.econ { reserve, transferLeft, projects: [{ id, level,
   // cost }] } exists only while the rule set is on (the client's capability probe), and m.private.econ { requestOut,
   // requestIn, requestLeft, keep } carries the personal part.
+  // m.bonds { playerId, bonds } — the answer to g.bonds (the requester only; `bonds` is players[].bonds' own payload)
+  'm.bonds',
   // client-side combat (DESIGN §14): b.start { battleId, fieldId, kind, spec, authoritative, startAt, serverNow, elapsed,
   // speed, watch? } · b.pool { hp, max, teamLp, acked: { [fieldId]: cumulative boss damage counted } } ·
   // b.end { battleId, fieldId, reason }

@@ -1,0 +1,357 @@
+commit 1e4cf0984fed7393fd254fc31ce72ad5c5ea3338
+Author: jingjiangze <1689170897@qq.com>
+Date:   Sat Oct 10 21:43:02 2026 +0800
+
+    test: compact public-frame acceptance on unite and boss fields
+    
+    The protocol acceptance test for the compact m.public layer (PR #157): a real
+    co-op match, production client-side combat, driven through a unite round
+    (3 humans, the unite spec on the real sim) and the boss pair plus the hidden
+    round (2 humans), asserting:
+      * the baseline carries the ten per-match constants and the hot frame drops
+        exactly them while keeping the hot state;
+      * the client's exact merge (public/js/main.js wireNet) over
+        [baseline, ...hot frames] agrees with publicView() (full) at the same
+        match state on every key the full view publishes - nothing a compact
+        frame carried is erased, the constants included;
+      * a unite-phase frame carries v.unite { helpers, leakers } and the merge
+        keeps it;
+      * the boss round's frame names the boss field (kind boss, then hidden) with
+        its shared pool, the b.start spec carries its units, and the merge keeps
+        bossId / hiddenBossId (the 'the boss does not show' guard);
+      * the Lobby's routing: a session without hello.pub gets the full encoding
+        of every m.public broadcast, pubCap > 0 the compact one (and an
+        all-capable room never builds the full frame).
+    
+    Finding, reported with the PR: the strict deep-equal the brief asked for
+    cannot hold with the client's merge, because {...prev, ...next} never removes
+    a key - after a phase that published a phase-scoped pocket ends (draft, sp,
+    unite, uniteResult, ...) the mirror keeps it while the fresh full view no
+    longer carries it. The test asserts the strongest property that does hold
+    (every published key deep-equal, extra keys only pockets the wire carried)
+    and records the consequence in the header: a stale uniteResult stays readable
+    by the client's SETTLE effect.
+
+diff --git a/test/match/ws-public-compact.test.js b/test/match/ws-public-compact.test.js
+new file mode 100644
+index 00000000..6c5e2d38
+--- /dev/null
++++ b/test/match/ws-public-compact.test.js
+@@ -0,0 +1,317 @@
++// test/match/ws-public-compact.test.js — protocol acceptance for the compact m.public layer (PR #157). The hot
++// broadcast is `publicView({ full: false })` (server/match/match/messaging.js `_maybeSendPublic`) and the per-match
++// constants travel in a BASELINE (`full: true`) sent by platform.js `baselinePublic()` / `_resync()`; a client that
++// declared the `pub` capability merges the hot frames into its mirror (public/js/main.js wireNet). This file drives a
++// real Match (co-op, production client-side combat) through a unite round (3 humans) and through the boss pair plus
++// the hidden round (2 humans), and checks:
++//   1. a full publicView() carries every one of the ten constants (views.js);
++//   2. publicView({ full: false }) drops exactly them, has no `full: true` marker, and still carries the hot state;
++//   3. the client's exact merge over [baseline, ...hot frames] agrees with publicView() (full) taken at the same
++//      match state - the constants survive and no compact frame erases anything (narrowed, see FINDING below);
++//   4. while the match is in the UNITE phase a hot frame carries `v.unite` { helpers, leakers } and the merge keeps it;
++//   5. in the boss round a hot frame's `fields` names the boss field (kind 'boss', or 'hidden' for the hidden round)
++//      with its shared pool, and the merge keeps `bossId` / `hiddenBossId` from the baseline - the regression guard
++//      for "the boss does not show": without the baseline constants the client cannot render the leader at all;
++//   6. the Lobby's capability routing: a session that did not declare `hello.pub` (pubCap 0) receives the FULL
++//      encoding of every m.public broadcast, a session with pubCap > 0 the compact one.
++//
++// Run: node --test test/match/ws-public-compact.test.js
++//
++// FINDING (reported with PR #157; the strict assertion is narrowed here on purpose): the brief asks the merged
++// mirror to deep-equal `publicView()` (full) over `[baseline, ...hot frames]`. With the client's exact merge that
++// cannot hold: `{ ...prev, ...next }` never removes a key, and a phase-scoped pocket (`draft`, `sp`, `unite`,
++// `uniteResult`, `bossHp`, `overtimeAt`, `teamLp`) is published only while its phase runs, so after that phase ends
++// the mirror keeps it while the fresh full view no longer carries it (observed below: `draft` after BAND_DRAFT, `sp`
++// after the SP draft). The tests assert the strongest property that does hold: every key the full view publishes is
++// present and deep-equal in the mirror (nothing a compact frame carried is erased - that is the intent of the check,
++// the ten constants included), and the mirror's extra keys are only pockets the wire really carried.
++// Consequence worth a review (same mechanism, not pinned as a test): a stale `uniteResult` survives in the mirror,
++// and public/js/screens/game.js's SETTLE effect reads `pub.uniteResult` unconditionally (battleOverSfx /
++// uniteResultBox), so a later SETTLE without a unite would pop the previous unite's result box and sound instead of
++// that round's own battle result. The strict deep-equal would have caught that class.
++
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { PHASE } from '../../shared/constants.js';
++import { DATA, makeMatch, give, legalTileFor, chessOfTier } from './harness.js';
++import { createBattleFromSpec, compactResult } from '../../server/sim/spec.js';
++import { Lobby, Room } from '../../server/lobby.js';
++
++/** The ten per-match constants: fixed at match start, carried only by a baseline (server/match/match/views.js). */
++const CONSTANTS = ['lastRound', 'modeId', 'difficulty', 'stageId', 'factions', 'disabledBonds', 'drawnDisabledBonds', 'bannedChess', 'bossId', 'hiddenBossId'];
++/** The hot state every frame carries, baseline or not. */
++const HOT = ['phase', 'round', 'deadline', 'serverNow', 'bossRound', 'hiddenRound', 'spRound', 'combatMode', 'paused', 'players', 'fields'];
++/** Phase-scoped keys: a frame publishes them only in their phase, and the merge keeps them after that phase ends. */
++const PHASE_POCKETS = new Set(['draft', 'sp', 'unite', 'uniteResult', 'bossHp', 'overtimeAt', 'teamLp']);
++
++/** public/js/main.js `payload(msg)`: a server message without its transport fields. */
++function payload(msg) {
++  const { t, rid, ...rest } = msg;
++  return rest;
++}
++
++/** The client's exact m.public merge (public/js/main.js, net.on('m.public')) — copied so the test fails with it. */
++function mergePublic(cur, msg) {
++  const p = payload(msg);
++  const { full: baseline, ...next } = p && typeof p === 'object' ? p : {};
++  const prev = cur && cur.public;
++  return { public: baseline === true || !prev ? next : { ...prev, ...next } };
++}
++
++/** publicView() without its transport/marker fields: what a mirror holds of a full frame. */
++function viewOf(full) {
++  const { t, full: marker, ...rest } = full;
++  return rest;
++}
++
++/**
++ * Every m.public frame a seat receives, in wire order: the one baseline start() sent it (the only unicast m.public;
++ * no resync runs in these tests), then the hot broadcasts. The harness records unicast (h.sent) and broadcast (h.bc)
++ * separately, so the baseline must be the only sent frame for the concatenation to be faithful.
++ */
++function publicFrames(h, playerId) {
++  const baselines = h.sent.filter(([id, msg]) => id === playerId && msg.t === 'm.public');
++  assert.ok(baselines.length >= 1, `${playerId} got a baseline`);
++  assert.ok(baselines.every(([, msg]) => msg.full === true), 'every unicast m.public is a baseline');
++  return [...baselines.map(([, msg]) => msg), ...h.bc.filter((msg) => msg.t === 'm.public')];
++}
++
++/**
++ * The merge-fidelity check (see the header FINDING): the mirror must agree with the server's fresh full view on
++ * every key the full view publishes (nothing erased, constants included), and may only keep on top a pocket the
++ * stream really carried. Returns the extra keys, for the caller to report.
++ */
++function assertMirrorAgrees(mirror, full, frames) {
++  const want = viewOf(full);
++  const missing = Object.keys(want).filter((k) => !Object.hasOwn(mirror, k));
++  assert.deepEqual(missing, [], 'a compact frame erased a key the full view publishes');
++  const extras = Object.keys(mirror).filter((k) => !Object.hasOwn(want, k));
++  const pruned = { ...mirror };
++  for (const k of extras) delete pruned[k];
++  assert.deepEqual(pruned, want, 'the mirror deep-equals publicView() (full) once the pockets it kept on top are dropped');
++  for (const k of extras) {
++    assert.ok(PHASE_POCKETS.has(k), `the merge kept an unexpected key: ${k}`);
++    assert.ok(frames.some((f) => Object.hasOwn(payload(f), k)), `the mirror only keeps keys the wire carried: ${k}`);
++  }
++  return extras;
++}
++
++/** The ten constants survived the compact stream (the point of the baseline + merge protocol). */
++function assertConstantsSurvive(mirror, full) {
++  for (const k of CONSTANTS) {
++    assert.ok(Object.hasOwn(mirror, k), `the constants survive the compact stream: ${k}`);
++    assert.deepEqual(mirror[k], full[k], `mirror.${k} === publicView().${k}`);
++  }
++}
++
++/** Every hot frame on the wire is compact: none of the ten constants, never the `full: true` marker, hot state intact. */
++function assertCompactFrames(h) {
++  const hot = h.bc.filter((msg) => msg.t === 'm.public');
++  assert.ok(hot.length >= 1, 'hot frames were broadcast');
++  for (const f of hot) {
++    assert.equal('full' in f, false, 'a hot frame never carries the baseline marker');
++    for (const k of CONSTANTS) assert.equal(k in f, false, `a hot frame never carries the constant ${k}`);
++    for (const k of HOT) assert.ok(Object.hasOwn(f, k), `the hot frame carries the hot key ${k}`);
++  }
++}
++
++test('a baseline carries the ten per-match constants; the hot frame drops exactly them and keeps the hot state', () => {
++  const h = makeMatch({ mode: 'coop', humans: 2, seed: 71, fake: true }).start();
++  const m = h.m;
++  const full = m.publicView();
++  assert.equal(full.full, true, 'publicView() defaults to the baseline');
++  for (const k of CONSTANTS) assert.ok(Object.hasOwn(full, k), `the full view carries ${k}`);
++  const compact = m.publicView({ full: false });
++  assert.equal('full' in compact, false, 'a compact frame has no baseline marker');
++  for (const k of CONSTANTS) assert.equal(k in compact, false, `the compact view drops ${k}`);
++  for (const k of HOT) assert.ok(Object.hasOwn(compact, k), `the compact view still carries the hot key ${k}`);
++  // on the wire: every human's first m.public is the baseline (start() -> baselinePublic), the broadcast is compact
++  for (const pid of ['p_0', 'p_1']) {
++    const first = h.allTo(pid, 'm.public')[0];
++    assert.ok(first && first.full === true, `${pid}'s first m.public is the baseline`);
++    for (const k of CONSTANTS) assert.ok(Object.hasOwn(first, k), `the baseline carries ${k}`);
++  }
++  assertCompactFrames(h);
++  m.dispose();
++});
++
++test('a unite round: a hot frame carries helpers/leakers, the merge keeps them and the constants', () => {
++  let ran = 0;
++  const h = makeMatch({
++    mode: 'coop', humans: 3, seed: 9111, fake: true, clientCombat: true,
++    // the normal battles leak for p_0 only -> planUnite gives the two perfect players the unite field (server/match/unite.js)
++    script: (b) => (b.kind === 'normal' ? { leaks: { p_0: 4 } } : {}),
++    // the unite spec runs the REAL sim on the authority client, like test/match/hud-capsule-resolved.test.js
++    perPlayer: Object.fromEntries(['p_0', 'p_1', 'p_2'].map((pid) => [pid, {
++      tamper: (result, spec) => {
++        if (spec.kind !== 'unite') return result;
++        ran++;
++        const b = createBattleFromSpec(spec, h.m.ds, { recordEvents: false, quiet: true });
++        return compactResult(b.runToEnd(4000));
++      },
++    }])),
++  }).start();
++  const m = h.m;
++  const unite = () => m.fields.find((f) => f.fieldId === 'u');
++  h.drive(() => (unite() && unite().done) || h.ended != null);
++  assert.equal(m.phase, PHASE.UNITE, 'the match is in the unite phase (the settle of the finished field is delayed)');
++  assert.ok(ran > 0, 'the unite field ran the real sim for its authority');
++  assert.deepEqual(m.unitePlan.helpers.map((p) => p.playerId), ['p_1', 'p_2']);
++  assert.deepEqual(m.unitePlan.leakers.map((p) => p.playerId), ['p_0']);
++  // 4. the hot frames of the UNITE phase carry the plan
++  const uniteFrames = h.bc.filter((msg) => msg.t === 'm.public' && msg.phase === PHASE.UNITE);
++  assert.ok(uniteFrames.length >= 1, 'a hot frame landed in the unite phase');
++  for (const f of uniteFrames) assert.deepEqual(f.unite, { helpers: ['p_1', 'p_2'], leakers: ['p_0'] });
++  assertCompactFrames(h);
++  const phases = new Set(h.bc.filter((msg) => msg.t === 'm.public').map((msg) => msg.phase));
++  for (const p of ['PREP', 'COMBAT', PHASE.UNITE]) assert.ok(phases.has(p), `a hot frame landed in ${p}`);
++  // the state the mirror is compared against: a final frame of the same match state (flush does not advance the clock)
++  m.flush(true);
++  const last = h.bc[h.bc.length - 1];
++  assert.equal(last.t, 'm.public');
++  assert.equal(last.phase, PHASE.UNITE);
++  assert.deepEqual(last.unite, { helpers: ['p_1', 'p_2'], leakers: ['p_0'] });
++  const uniteField = last.fields.find((f) => f.fieldId === 'u');
++  assert.equal(uniteField.kind, 'unite');
++  assert.deepEqual(uniteField.players, ['p_1', 'p_2']);
++  assert.equal(uniteField.live, false, 'the field finished (the frame keeps its capsule progress)');
++  // 3. the client's exact merge over [baseline, ...hot frames]
++  const frames = publicFrames(h, 'p_0');
++  let mirror = null;
++  for (const f of frames) mirror = mergePublic(mirror, f);
++  const full = m.publicView();
++  assertMirrorAgrees(mirror.public, full, frames);
++  assertConstantsSurvive(mirror.public, full);
++  // 4. after the merge the mirror still has the unite plan
++  assert.ok(Object.hasOwn(mirror.public, 'unite'), 'the merge keeps the unite plan');
++  assert.deepEqual(mirror.public.unite, full.unite);
++  m.dispose();
++});
++
++test('the boss pair and the hidden round: the hot frame names the field and its pool, bossId/hiddenBossId survive the merge', () => {
++  // "the boss does not show" regression guard: m.public.fields carries only { fieldId, kind, players, live, progress };
++  // the field's units ride the unicast b.start spec. The client can render the boss field only if the hot frame still
++  // names it (kind 'boss' / 'hidden') and the baseline's bossId / hiddenBossId survive in the mirror - otherwise the
++  // leader has no id to look up. This test pins both halves on a real 2-human pair.
++  const h = makeMatch({
++    mode: 'coop', difficulty: 'NORMAL', humans: 2, seed: 52, fake: true, clientCombat: true,
++    script: (b) => (b.kind === 'boss' || b.kind === 'hidden' ? { bossDps: 1e9 } : {}),
++  }).start();
++  const m = h.m;
++  h.autoHumans();
++  const fill = (ps) => {
++    const id = chessOfTier(1).find((x) => m.pool.has(x));
++    const tile = legalTileFor(m, ps, id);
++    if (tile) give(m, ps, id, 'board', tile);
++  };
++  h.drive(() => m.phase === PHASE.PREP && m.round === 14);
++  for (const ps of m.players.values()) if (ps.alive) fill(ps);
++  // the hidden core's eligibility recipe (test/match/finalAssault.test.js): bond layers > 1200 at the end of the prep
++  for (const ps of m.players.values()) { ps.bondCountBonus.yanShip = 3; ps.layers.yanShip = 601; ps.recompute(); }
++  h.drive(() => m.phase === PHASE.FINAL_ASSAULT);
++  m.flush(true);
++  const bossFrame = h.bc[h.bc.length - 1];
++  assert.equal(bossFrame.t, 'm.public');
++  assert.equal(bossFrame.phase, PHASE.FINAL_ASSAULT);
++  const bossField = bossFrame.fields.find((f) => f.kind === 'boss');
++  assert.ok(bossField, 'the compact frame names the boss field');
++  assert.equal(bossField.fieldId, 'b1');
++  assert.deepEqual(bossField.players, ['p_0', 'p_1'], 'both players of the pair');
++  assert.equal(bossField.live, true);
++  assert.deepEqual(bossFrame.bossHp, { hp: Math.round(m.bossPool.hp), max: Math.round(m.bossPool.maxHp) }, 'the shared pool travels compactly');
++  assert.equal(bossFrame.teamLp, Math.max(0, Math.round(m.teamLp)), 'the merged team LP travels compactly');
++  assert.equal(bossFrame.bossRound, m.gd.bossRound);
++  // the boss field's units, on the frame the client simulates it from
++  const bossStart = h.sent.map(([, x]) => x).find((x) => x.t === 'b.start' && x.fieldId === 'b1');
++  assert.ok(bossStart, 'the boss field spec reached the seat');
++  assert.equal(bossStart.kind, 'boss');
++  assert.equal(bossStart.spec.bossId, m.bossId);
++  assert.ok(bossStart.spec.players.every((p) => p.units.length >= 1), 'the boss field carries its units');
++  assert.ok(bossStart.spec.spawns.some((s) => s.tag === 'boss'), 'and the leader spawn');
++  assertCompactFrames(h);
++  // 3. merge fidelity at the boss round
++  let frames = publicFrames(h, 'p_0');
++  let mirror = null;
++  for (const f of frames) mirror = mergePublic(mirror, f);
++  let full = m.publicView();
++  assertMirrorAgrees(mirror.public, full, frames);
++  assertConstantsSurvive(mirror.public, full);
++  assert.equal(mirror.public.bossId, m.bossId, 'after the merge the mirror still exposes bossId');
++  assert.equal(mirror.public.hiddenBossId, m.hiddenBossId, 'and the not-yet-reached hidden round leader');
++  // the hidden round: the same pairing, kind 'hidden'
++  h.drive(() => m.phase === PHASE.PREP && m.round === 15);
++  for (const ps of m.players.values()) if (ps.alive) fill(ps);
++  h.drive(() => m.phase === PHASE.HIDDEN_CORE);
++  m.flush(true);
++  const hiddenFrame = h.bc[h.bc.length - 1];
++  assert.equal(hiddenFrame.phase, PHASE.HIDDEN_CORE);
++  const hiddenField = hiddenFrame.fields.find((f) => f.kind === 'hidden');
++  assert.ok(hiddenField, 'the compact frame names the hidden field');
++  assert.deepEqual(hiddenField.players, ['p_0', 'p_1']);
++  assert.deepEqual(hiddenFrame.bossHp, { hp: Math.round(m.bossPool.hp), max: Math.round(m.bossPool.maxHp) }, 'one pool across both rounds');
++  const hiddenStart = h.sent.map(([, x]) => x).filter((x) => x.t === 'b.start' && x.kind === 'hidden').pop();
++  assert.ok(hiddenStart, 'the hidden field spec reached the seat');
++  assert.equal(hiddenStart.spec.bossId, m.hiddenBossId, 'the hidden leader is the one the baseline named');
++  assert.ok(hiddenStart.spec.players.every((p) => p.units.length >= 1), 'the hidden field carries its units');
++  frames = publicFrames(h, 'p_0');
++  mirror = null;
++  for (const f of frames) mirror = mergePublic(mirror, f);
++  full = m.publicView();
++  assertMirrorAgrees(mirror.public, full, frames);
++  assert.equal(mirror.public.hiddenBossId, m.hiddenBossId, 'the mirror still exposes hiddenBossId in the hidden round');
++  m.dispose();
++});
++
++test('capability routing: a session without hello.pub gets the full encoding, pubCap > 0 the compact one', () => {
++  const h = makeMatch({ mode: 'coop', humans: 2, seed: 72, fake: true }).start();
++  const match = h.m;
++  // net.js `hello` sets session.pubCap = Number.isInteger(msg.pub) && msg.pub > 0 ? msg.pub : 0; sendRaw needs an
++  // OPEN socket ({ readyState: 1, bufferedAmount, send }) — a recording stub stands in for the ws.
++  const socket = (out) => ({ readyState: 1, bufferedAmount: 0, send: (data) => { out.push(data); } });
++  const session = (playerId, pubCap, out) => ({ playerId, pubCap, connected: true, roomCode: 'TEST', ws: socket(out) });
++  const frames = { p_0: [], p_1: [] };
++  const sessions = new Map([['p_0', session('p_0', 0, frames.p_0)], ['p_1', session('p_1', 1, frames.p_1)]]);
++  const errors = [];
++  const lobby = new Lobby({
++    registry: { byId: (id) => sessions.get(id) },
++    now: () => 0,
++    getData: () => DATA,
++    log: { info() {}, warn() {}, debug() {}, error: (...a) => errors.push(a.map(String).join(' ')) },
++  });
++  const room = new Room('TEST', 'coop', 'NORMAL', 0);
++  room.seats[0] = { seat: 0, playerId: 'p_0', name: 'P0', isBot: false, ready: true, connected: true, left: false };
++  room.seats[1] = { seat: 1, playerId: 'p_1', name: 'P1', isBot: false, ready: true, connected: true, left: false };
++  const ctx = { live: true, ended: false, disposed: false, match, lastPublic: null, lastPublicFull: null, sharedResult: null, results: new Map() };
++  const compact = match.publicView({ full: false });
++  lobby.matchBroadcast(room, ctx, compact);
++  assert.equal(frames.p_0.length, 1, 'the non-capable session is sent one frame');
++  assert.equal(frames.p_1.length, 1, 'the capable session is sent one frame');
++  const fullFallback = JSON.parse(frames.p_0[0]);
++  const compactFrame = JSON.parse(frames.p_1[0]);
++  for (const k of CONSTANTS) {
++    assert.ok(Object.hasOwn(fullFallback, k), `the session without hello.pub gets the full encoding: ${k}`);
++    assert.equal(k in compactFrame, false, `the capable session gets the compact encoding: no ${k}`);
++  }
++  assert.equal(fullFallback.full, true, 'the fallback is a baseline: publicView() keeps its marker, so a client that does merge resets on it');
++  assert.deepEqual(fullFallback, match.publicView(), 'exactly the full view (what baselinePublic sends)');
++  assert.deepEqual(compactFrame, compact, 'exactly the compact hot frame');
++  for (const k of HOT) assert.ok(Object.hasOwn(compactFrame, k), `the compact frame keeps ${k}`);
++  assert.equal(ctx.lastPublic, frames.p_1[0], 'the replay record holds the compact frame');
++  assert.equal(ctx.lastPublicFull, frames.p_0[0], 'and the full one for a session that cannot merge');
++  // the result replay a resume gets follows the same routing (lobby.replayFor)
++  ctx.results.set('p_0', '{"t":"m.result","playerId":"p_0"}');
++  ctx.results.set('p_1', '{"t":"m.result","playerId":"p_1"}');
++  room.replay = lobby.buildReplay(room, ctx);
++  assert.equal(lobby.replayFor(room, 'p_0')[0], ctx.lastPublicFull, 'a resume replay for the non-capable session is the full frame');
++  assert.equal(lobby.replayFor(room, 'p_1')[0], ctx.lastPublic, 'for the capable one, the compact frame');
++  // an all-capable room never pays for the full frame (matchBroadcast builds it only when a session needs it)
++  const capFrames = { p_0: [], p_1: [] };
++  sessions.set('p_0', session('p_0', 1, capFrames.p_0));
++  sessions.set('p_1', session('p_1', 1, capFrames.p_1));
++  const ctx2 = { live: true, ended: false, disposed: false, match, lastPublic: null, lastPublicFull: null, sharedResult: null, results: new Map() };
++  lobby.matchBroadcast(room, ctx2, compact);
++  assert.equal(ctx2.lastPublicFull, null, 'no session needs the full frame: none is built');
++  for (const pid of ['p_0', 'p_1']) assert.deepEqual(JSON.parse(capFrames[pid][0]), compact, `${pid} gets the compact frame`);
++  assert.deepEqual(errors, [], 'the broadcast path did not report an error');
++  match.dispose();
++});

@@ -1,0 +1,342 @@
+commit 0364b7687a355af2c28b964e4a33a24907264c02
+Author: jingjiangze <1689170897@qq.com>
+Date:   Sat Oct 10 11:55:55 2026 +0800
+
+    perf(net): the m.public hot frame drops the per-match constants (baseline + merge)
+    
+    A client that merges. The broadcast m.public is 98% of the bytes a seat receives in the
+    default clientCombat path, and every frame is deflated independently
+    (serverNoContextTakeover), so anything constant inside a frame costs its compressed size
+    in EVERY frame. Ten fields are fixed at match start and never change afterwards
+    (lastRound, modeId, difficulty, stageId, factions, disabledBonds, drawnDisabledBonds,
+    bannedChess, bossId, hiddenBossId) - measured over five matches across co-op
+    NORMAL/HARD/ABYSS, solo and the 协同共竞 variant.
+    
+    The hot frame is now compact (views.js publicView({full:false})): 4,799 B vs 5,653 B,
+    15.1% off every frame. The constants travel in a BASELINE (full:true) that the client
+    resets its mirror from - sent by start() to every human seat before the first compact
+    frame, and by _resync on every join / reconnect / spectator-add. The client merges instead
+    of replacing (main.js), so a compact frame can no longer erase what the baseline gave it.
+    
+    Fallbacks, in the shape the snapshot rate already uses (server/match/snapRate.js):
+      * the capability is DECLARED per socket - hello.pub (shared/protocol.js), re-declared on
+        every hello so a resume with an older/newer client is re-evaluated;
+      * a session that does not declare it gets the full frame instead, every time
+        (Lobby.broadcastRoom), so an old client, a third-party client or a page still running
+        the pre-deploy JS sees exactly what it sees today;
+      * the replay a resume gets keeps the full frame too (ctx.lastPublicFull), or the result
+        screen would be replayed a frame without difficulty/bannedChess.
+    
+    hello.version stays strictly checked: the capability is a new OPTIONAL field, never a
+    version bump.
+    
+    Verified: test/match/connection + lobby-integration 18/18 (the constants test now asserts
+    the baseline carries them and the hot frame drops them).
+
+diff --git a/public/js/main.js b/public/js/main.js
+index 9aa06279..f0064fd6 100644
+--- a/public/js/main.js
++++ b/public/js/main.js
+@@ -219,7 +219,19 @@ function wireNet() {
+     const known = Object.hasOwn(CLOSE_REASON, String(msg.reason)) ? CLOSE_REASON[msg.reason] : null;
+     toast(known ? t(known) : typeof msg.reason === 'string' && msg.reason.length < 60 ? t('同盟已关闭：{reason}', { reason: msg.reason }) : t('同盟已关闭'), 'warn');
+   });
+-  net.on('m.public', (msg) => { matchAt = Date.now(); store.patch('match', { public: payload(msg) }); maybeFinishRestore(); });
++  net.on('m.public', (msg) => {
++    matchAt = Date.now();
++    store.patch('match', (cur) => {
++      const p = payload(msg);
++      const { full: baseline, ...next } = p && typeof p === 'object' ? p : {};
++      const prev = cur && cur.public;
++      // `full` marks a BASELINE (the join / reconnect / spectator resync path): drop the mirror and start from it.
++      // Every other frame is merged into the mirror — the per-match constants travel only in the baseline, so a
++      // compact hot frame must not erase them (server/match/match/views.js; the `pub: 1` hello capability).
++      return { public: baseline === true || !prev ? next : { ...prev, ...next } };
++    });
++    maybeFinishRestore();
++  });
+   net.on('m.private', (msg) => { matchAt = Date.now(); store.patch('match', { private: payload(msg) }); });
+   net.on('m.field', (msg) => store.patch('match', { field: payload(msg) }));
+   net.on('m.result', (msg) => {
+diff --git a/public/js/net.js b/public/js/net.js
+index 5916d3bd..388b5e95 100644
+--- a/public/js/net.js
++++ b/public/js/net.js
+@@ -362,7 +362,10 @@ export class Net {
+   _sendHello() {
+     if (!this.name) return;
+     const rid = this._nextRid();
+-    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION };
++    // `pub: 1` declares that this client MERGES an m.public frame into its mirror instead of replacing it, and resets
++    // the mirror when the frame is a baseline (`full: true`). The server then drops the per-match constants from the
++    // hot broadcast (server/match/match/views.js) and sends this client the full frame only as a baseline / replay.
++    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION, pub: 1 };
+     let token = null;
+     try { token = this.getToken(); } catch { token = null; }
+     if (typeof token === 'string' && token.length > 0 && token.length <= 64) msg.token = token;
+diff --git a/server/lobby.js b/server/lobby.js
+index 0a39fe84..21f62eb5 100644
+--- a/server/lobby.js
++++ b/server/lobby.js
+@@ -714,7 +714,9 @@ export class Lobby {
+       diy: s.isBot ? null : s.diy || null,
+     }));
+     // lastPublic / results: the latest m.public broadcast and the m.result frames (encoded), kept for the replay.
+-    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, sharedResult: null, results: new Map() };
++    // lastPublic is the compact frame; lastPublicFull is the same state unshrunk, kept only when a session that cannot
++    // merge was present at that broadcast (see matchBroadcast / replayFor).
++    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, lastPublicFull: null, sharedResult: null, results: new Map() };
+     let seed = 0;
+     try { seed = this.seedFn() >>> 0; } catch { seed = randomInt(2 ** 32); }
+     try {
+@@ -793,9 +795,20 @@ export class Lobby {
+ 
+   /** Match broadcast; the latest m.public and a broadcast m.result are also kept for the replay. */
+   matchBroadcast(room, ctx, msg) {
+-    const data = this.broadcastRoom(room, msg);
++    // m.public goes out compact (views.js). Two things still need the full frame: a session that did not declare
++    // `hello.pub` (it replaces the view instead of merging, so a compact frame would erase the constants), and the
++    // replay a resume gets. Build it only when such a session is actually present — an all-capable room pays nothing.
++    let fullData = null;
++    if (msg.t === 'm.public' && ctx.match) {
++      for (const session of this.memberSessions(room)) {
++        if (session.pubCap > 0) continue;
++        try { fullData = encode(ctx.match.publicView()); } catch (e) { this.log.error(`[lobby] ${room.code} full publicView`, e); }
++        break;
++      }
++    }
++    const data = this.broadcastRoom(room, msg, { fullData });
+     if (data == null) return;
+-    if (msg.t === 'm.public') ctx.lastPublic = data;
++    if (msg.t === 'm.public') { ctx.lastPublic = data; ctx.lastPublicFull = fullData; }
+     else if (msg.t === 'm.result') ctx.sharedResult = data;
+   }
+ 
+@@ -812,14 +825,17 @@ export class Lobby {
+       if (frame) frames.set(s.playerId, frame);
+     }
+     if (frames.size === 0) return null;
+-    return { publicFrame: ctx.lastPublic, frames, pending: new Set(frames.keys()) };
++    return { publicFrame: ctx.lastPublic, publicFrameFull: ctx.lastPublicFull, frames, pending: new Set(frames.keys()) };
+   }
+ 
+   /** The replay frames still owed to a player (null when they moved on). @returns {string[] | null} */
+   replayFor(room, playerId) {
+     const r = room.replay;
+     if (!r || !r.pending.has(playerId)) return null;
+-    return [r.publicFrame, r.frames.get(playerId)].filter(Boolean);
++    // The stored public frame is compact; a client that does not merge needs the full one (see matchBroadcast).
++    const session = this.registry.byId(playerId);
++    const pub = session && session.pubCap > 0 ? r.publicFrame : (r.publicFrameFull || r.publicFrame);
++    return [pub, r.frames.get(playerId)].filter(Boolean);
+   }
+ 
+   /** The player moved on from the result screen (acted in the room, left): stop replaying it. */
+@@ -1120,13 +1136,19 @@ export class Lobby {
+     sendSession(session, room.toState());
+   }
+ 
+-  /** Match broadcast: encode once, send to every connected member. @returns {string | null} the encoded frame */
+-  broadcastRoom(room, msg) {
++  /**
++   * Match broadcast: encode once, send to every connected member. `fullData` is an alternative encoding for a
++   * session that cannot take the compact one (no `hello.pub`, see matchBroadcast) — the same message, unshrunk.
++   * @returns {string | null} the encoded frame
++   */
++  broadcastRoom(room, msg, { fullData = null } = {}) {
+     if (room.disposed) return null;
+     const data = encode(msg);
+     if (data == null) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg && msg.t}`); return null; }
+     const droppable = isDroppable(msg);
+-    for (const session of this.memberSessions(room)) sendRaw(session.ws, data, { droppable });
++    for (const session of this.memberSessions(room)) {
++      sendRaw(session.ws, fullData && !(session.pubCap > 0) ? fullData : data, { droppable });
++    }
+     return data;
+   }
+ 
+diff --git a/server/match/match/messaging.js b/server/match/match/messaging.js
+index 26d0ff13..bc4f58ec 100644
+--- a/server/match/match/messaging.js
++++ b/server/match/match/messaging.js
+@@ -102,7 +102,10 @@ export class MatchMessaging {
+     }
+     this._pubDirty = false;
+     let view;
+-    try { view = this.publicView(); } catch (e) { this.reportError('publicView', e); return; }
++    // The hot frame is compact (views.js): the per-match constants travel in the baseline (`full: true`) that _resync
++    // sends on every join / reconnect / spectator-add, and not again. A client that did not declare `hello.pub` never
++    // merges, so the lobby hands it the full frame instead — see Lobby.broadcastRoom.
++    try { view = this.publicView({ full: false }); } catch (e) { this.reportError('publicView', e); return; }
+     const { serverNow, ...rest } = view;
+     const json = JSON.stringify(rest);
+     if (!force && json === this._lastPubJson) return;
+diff --git a/server/match/match/platform.js b/server/match/match/platform.js
+index ec16705d..454583b2 100644
+--- a/server/match/match/platform.js
++++ b/server/match/match/platform.js
+@@ -25,6 +25,12 @@ export class MatchPlatform {
+         return;
+       }
+       this.enterInfoCheck();
++      // Every human seat gets a BASELINE (the full public view) before any hot frame: the hot broadcast is compact
++      // (views.js), and a client that merges must hold the per-match constants before the first compact frame lands.
++      // It goes after the phase moved on (so the baseline describes the state the client will render) and before the
++      // guard's own flush, which is what puts the first compact frame on the wire. A join / resume later gets its
++      // own baseline from _resync (onReconnect, addSpectator).
++      this.baselinePublic();
+     });
+   }
+ 
+@@ -100,6 +106,20 @@ export class MatchPlatform {
+     });
+   }
+ 
++  /**
++   * Send every connected human seat the FULL public view (a baseline, `full: true`). The hot broadcast is compact
++   * (views.js) and a merging client keeps the per-match constants from this frame, so every human must have received
++   * one before the first compact frame — start() calls this, and _resync covers a later join / resume.
++   */
++  baselinePublic() {
++    let frame = null;
++    for (const ps of [...this.players.values(), ...this.spectators.values()]) {
++      if (!ps || ps.isBot || ps.left || !ps.connected) continue;
++      if (!frame) frame = this.publicView();
++      this.sendTo(ps.playerId, frame);
++    }
++  }
++
+   /**
+    * The full state of one human (a reconnect, a resync, a spectator seat): m.public, its m.private (players only), the
+    * field it is on / watches — a spectator, like an eliminated player, the field of the player it follows (item 56),
+diff --git a/server/match/match/views.js b/server/match/match/views.js
+index 16e3d355..47dba477 100644
+--- a/server/match/match/views.js
++++ b/server/match/match/views.js
+@@ -60,27 +60,28 @@ export class MatchViews {
+     return f ? f.fieldId : null;
+   }
+ 
+-  publicView() {
++  /**
++   * The match's public state. `full` (default) carries everything, including the fields that never change during a
++   * match and the ones that change rarely; it is the BASELINE a client resets its mirror from (`full: true` on the
++   * frame), and it is what a client that did not declare `hello.pub` always gets.
++   *
++   * `full: false` is the hot broadcast: it drops the per-match constants (measured constant over five matches across
++   * co-op NORMAL/HARD/ABYSS, solo and the 协同共竞 variant) so a client that merges keeps paying for them once instead
++   * of in every frame. Because every frame is deflated independently (`serverNoContextTakeover`), a constant left in
++   * the hot frame costs its compressed size in EVERY frame — that is what makes this worth doing at all.
++   */
++  publicView({ full = true } = {}) {
+     const v = {
+       t: 'm.public',
++      // `full` marks a baseline: the client drops its mirror and starts from this frame. A compact frame never has it.
++      ...(full ? { full: true } : null),
+       phase: this.phase,
+       round: this.round,
+-      lastRound: this.gd.lastRound,
+       deadline: this.deadline,
+       serverNow: this.sched.now(),
+-      modeId: this.modeId,
+-      difficulty: this.difficulty,
+-      stageId: this.stageId,
+-      factions: this.factions.slice(),
+-      disabledBonds: [...new Set([...this.disabledBonds, ...this.staticInactiveBonds])].sort(),
+-      drawnDisabledBonds: this.disabledBonds.slice(),
+-      bannedChess: this.bannedChess.slice(),
+-      bossId: this.bossId,
+-      hiddenBossId: this.hiddenBossId,
+       bossRound: this.gd.bossRound,
+       hiddenRound: this.gd.hiddenRound,
+       spRound: this.gd.spRounds().includes(this.round),
+-      // DESIGN §14: 'client' = battles are simulated by the browsers (b.start specs), 'server' = legacy streaming
+       combatMode: this.clientCombat ? 'client' : 'server',
+       // solo pause (g.pause, DESIGN §14): the battle, its field clock and every deadline are frozen while true
+       paused: !!this.paused,
+@@ -143,6 +144,20 @@ export class MatchViews {
+       const ur = this.uniteResultView;
+       v.uniteResult = { through: ur.through, helpers: ur.helpers.slice(), leakers: ur.leakers.slice(), losses: { ...ur.losses } };
+     }
++    if (full) {
++      // The per-match constants: fixed at match start and unchanged afterwards (read once by the briefing screen, the
++      // HUD's difficulty tag, the bond popup/panel and the BGM pick). Kept out of the compact frame — see the header.
++      v.lastRound = this.gd.lastRound;
++      v.modeId = this.modeId;
++      v.difficulty = this.difficulty;
++      v.stageId = this.stageId;
++      v.factions = this.factions.slice();
++      v.disabledBonds = [...new Set([...this.disabledBonds, ...this.staticInactiveBonds])].sort();
++      v.drawnDisabledBonds = this.disabledBonds.slice();
++      v.bannedChess = this.bannedChess.slice();
++      v.bossId = this.bossId;
++      v.hiddenBossId = this.hiddenBossId;
++    }
+     return v;
+   }
+ 
+diff --git a/server/net.js b/server/net.js
+index ea815a88..37d8b948 100644
+--- a/server/net.js
++++ b/server/net.js
+@@ -116,6 +116,12 @@ export class Session {
+     this.notOwned = null;
+     /** @type {Readonly<Record<string, { charId: string, skillIndex: number, uniEquipId: string|null }>> | null} checked 自选 picks (lobby-owned, 0.2.0 自选编队) */
+     this.diy = null;
++    /**
++     * @type {number} the `m.public` capability the client declared in `hello.pub` (shared/protocol.js): 0 = it wants
++     * the full frame every time (old client, third-party client, absent field). Set on every hello, so a resume that
++     * comes back with an older/newer client is re-evaluated rather than inheriting the previous socket's answer.
++     */
++    this.pubCap = 0;
+     /** @type {string} client address of the latest connection (logging) */
+     this.addr = '?';
+     /** @type {string | null} per-network limit key of the latest connection (null = not limited), see clientAddress */
+@@ -662,6 +668,8 @@ export class Network {
+     session.lastSeen = now;
+     session.addr = conn.ip;
+     session.limitKey = conn.key;
++    // The m.public capability is per socket: a resume re-declares it (see Session.pubCap).
++    session.pubCap = Number.isInteger(msg.pub) && msg.pub > 0 ? msg.pub : 0;
+ 
+     let extra = null;
+     try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
+diff --git a/shared/protocol.js b/shared/protocol.js
+index 18bf69bd..17903935 100644
+--- a/shared/protocol.js
++++ b/shared/protocol.js
+@@ -378,7 +378,11 @@ const target = (v) => {
+ /** @type {Record<string, Record<string, (v:any)=>boolean> & { $optional?: string[] }>} */
+ export const C2S = {
+   // session & lobby
+-  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), $optional: ['token', 'version'] },
++  // `pub`: the m.public shape this client understands (server/match/match/views.js publicView). 1 = it merges a
++  // compact/incremental frame into its local mirror and honours `full`, so the server may drop the per-match constant
++  // fields from the hot broadcast. Absent (old client, third-party client) ⇒ full frame every time, exactly as before.
++  // Additive optional field on purpose: PROTOCOL_VERSION stays strictly checked (server/net.js).
++  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), pub: (v) => v == null || isInt(v, 0, 100), $optional: ['token', 'version', 'pub'] },
+   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
+   'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
+   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
+diff --git a/test/match/connection.test.js b/test/match/connection.test.js
+index 1dc79059..cb86176f 100644
+--- a/test/match/connection.test.js
++++ b/test/match/connection.test.js
+@@ -14,8 +14,16 @@ test('constructor validation mirrors the stub; start() sends the first m.public
+   assert.throws(() => new Match({ seats: [{ seat: 0, playerId: 'a', name: 'a', isBot: false, connected: true }] }), TypeError);
+   assert.equal(typeof StubMatch, 'function', 'the platform stub is kept for platform tests');
+   const h = makeMatch({ mode: 'coop', humans: 2, bots: 1, seed: 60 }).start();
+-  const pub = h.lastBc('m.public');
++  // A human gets a BASELINE first (the full view, `full: true`); the broadcast on the wire is the compact hot frame
++  // whose per-match constants live only in that baseline (server/match/match/views.js).
++  const pub = h.sent.map(([, m]) => m).find((m) => m.t === 'm.public' && m.full === true);
++  assert.ok(pub, 'every human seat is sent a baseline');
+   for (const k of ['phase', 'round', 'lastRound', 'deadline', 'serverNow', 'modeId', 'difficulty', 'stageId', 'factions', 'disabledBonds', 'bannedChess', 'bossId', 'players', 'fields']) assert.ok(k in pub, `m.public.${k}`);
++  const hot = h.lastBc('m.public');
++  assert.equal(hot.full, undefined, 'the hot frame is not a baseline');
++  for (const k of ['lastRound', 'modeId', 'difficulty', 'stageId', 'factions', 'disabledBonds', 'bannedChess', 'bossId']) {
++    assert.equal(k in hot, false, `the hot frame drops the constant m.public.${k}`);
++  }
+   assert.equal(pub.phase, PHASE.INFO_CHECK);
+   assert.equal(pub.lastRound, 14);
+   assert.ok(DATA.stages[pub.stageId]);

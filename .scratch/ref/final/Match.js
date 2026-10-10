@@ -204,10 +204,6 @@ import { MatchReports } from './match/reports.js';
 import { MatchUnite } from './match/unitePhase.js';
 import { MatchBoss } from './match/bossRounds.js';
 import { MatchSettle } from './match/settle.js';
-import { MatchEconomy } from './match/economy.js';
-import { MatchRevival } from './match/revival.js';
-import { MatchSnapRate } from './match/snapRate.js';
-import { SnapRate, parseSnapRate } from './snapRate.js';
 
 export { FLOW_TICKER_PRIORITY, DELAYS, BAND_TURN_SECONDS } from './match/common.js';
 
@@ -223,14 +219,12 @@ export function parseVerify(v) {
   return s === 'all' || s === 'sample' ? s : 'off';
 }
 /**
- * SP_PUB_SYNC → 'full' | 'delta' (WS compression round 2, step ④). DEFAULT 'delta': the measured deflate win of the
- * delta chain is ~3x on m.public, which is what this layer exists for, and it is bounded by the periodic full
- * anchor plus per-recipient fallback (see views.js), so a client that falls behind heals instead of drifting.
- * 'full' is the one-step operational fallback (`SP_PUB_SYNC=full`, no redeploy) — old servers and any connection
- * that did not declare `hello.pubDelta` behave as 'full' regardless.
+ * SP_PUB_SYNC → 'full' | 'delta' (WS compression round 2, step ④; the doc's advertised fallback switch, default
+ * 'full'): 'full' = every hot m.public frame is complete (today's behavior on the compact baseline); 'delta' = a
+ * connection that declared hello.pubDelta gets delta frames, bounded by the periodic full anchor (views.js).
  */
 export function parsePubSync(v) {
-  return String(v ?? '').trim().toLowerCase() === 'full' ? 'full' : 'delta';
+  return String(v ?? '').trim().toLowerCase() === 'delta' ? 'delta' : 'full';
 }
 const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 
@@ -282,31 +276,10 @@ export class Match {
     this.clientCombat = opts.clientCombat != null ? !!opts.clientCombat : envClientCombat();
     this.verifyMode = parseVerify(opts.verify ?? env('SP_VERIFY'));
     /**
-     * Battle-snapshot rate (DESIGN §4, §8.2; server/match/snapRate.js). Two fixed rates, chosen per watcher by
-     * whether it DRIVES the field: a field's own players take a frame every SNAPSHOT_EVERY ticks (3 = 20 Hz at 2×),
-     * anything that merely watches every SNAPSHOT_EVERY_IDLE ticks (12 = 5 Hz) — each watcher counts its own ticks
-     * (fields.js _emit), so one field serves both at once.
-     *
-     * The adaptive second gear is RETIRED (2026-10-11): a connection used to be escalated to 20 Hz while its own
-     * link was jittery, which paid when the base was 10–15 Hz. With 20 Hz the base for everyone who drives a field,
-     * the client's 100 ms interpolation buffer already covers two intervals, so escalation had nothing left to buy.
-     * `opts.snapRate` / SP_SNAP_RATE still pins the base ('slow' | 'fast'; anything unrecognised is the base).
-     */
-    this.snapRateMode = parseSnapRate(opts.snapRate ?? env('SP_SNAP_RATE'));
-    // SP_SNAP_JITTER_MS moves the escalation threshold, should a denser gear be re-armed (server/match/snapRate.js
-    // hasFastGear()). The default 50 ms was measured where 10 Hz starts to visibly extrapolate against the client's
-    // 100 ms interpolation buffer; it is inert while there is one gear.
-    const jitterMs = Number(env('SP_SNAP_JITTER_MS'));
-    this.snapRate = new SnapRate(Number.isFinite(jitterMs) && jitterMs > 0 ? { escalateMs: jitterMs } : {});
-    /** `opts.linkOf(playerId)` → `{ rtts, buffered }` (server/net.js linkQualityOf) — absent ⇒ base rate and no samples. */
-    this.linkOf = typeof opts.linkOf === 'function' ? opts.linkOf : null;
-    this._snapRateAt = -Infinity;
-    /**
-     * The hot m.public shape (WS compression round 2, step ④; env SP_PUB_SYNC): 'full' sends every delta-capable
-     * recipient complete compact frames (per-recipient bonds included), 'delta' walks a per-recipient delta chain
-     * (views.js publicViewFor). Only connections that declared `hello.pubDelta` are affected; a fallback to 'full'
-     * needs no client change. DEFAULT 'delta' — the ~3x is why this layer exists, and the fallbacks are why leading
-     * with it is safe.
+     * The hot m.public shape (WS compression round 2, step ④; env SP_PUB_SYNC, default 'full' — the doc's switch):
+     * 'full' sends every delta-capable recipient complete compact frames (per-recipient bonds included), 'delta' walks a
+     * per-recipient delta chain (views.js publicViewFor). Only connections that declared `hello.pubDelta` are affected;
+     * a fallback to 'full' needs no client change.
      */
     this.pubSync = parsePubSync(opts.pubSync ?? env('SP_PUB_SYNC'));
     /** the delta chain's anchor cadence: complete frame after this many deltas / this long (engine-only test overrides) */
@@ -379,10 +352,6 @@ export class Match {
     this.factions = setup.factions;
     this.bossId = setup.bossId;
     this.hiddenBossId = setup.hiddenBossId;
-    // 协同经济 (DESIGN §28): the team reserve, the request layer and the two PvE rewards — inert while it is off
-    this.econInit();
-    // 救援 (DESIGN §29): 促融共竞 holds a downed teammate at 0 LP for the settle window instead of eliminating them
-    this.revivalInit();
     const bans = drawDisabledBonds(this.gd, this.rngSetup);
     this.disabledBonds = bans.drawn;
     this.staticInactiveBonds = bans.staticOff;
@@ -458,7 +427,7 @@ export class Match {
 }
 
 // the method modules, in this order (a name defined twice is an error, never a silent override)
-for (const part of [MatchPlatform, MatchInfra, MatchMessaging, MatchViews, MatchWatch, MatchIntents, MatchPause, MatchPhases, MatchSpDraft, MatchPrep, MatchCombat, MatchClientCombat, MatchReports, MatchUnite, MatchBoss, MatchSettle, MatchEconomy, MatchRevival, MatchSnapRate]) {
+for (const part of [MatchPlatform, MatchInfra, MatchMessaging, MatchViews, MatchWatch, MatchIntents, MatchPause, MatchPhases, MatchSpDraft, MatchPrep, MatchCombat, MatchClientCombat, MatchReports, MatchUnite, MatchBoss, MatchSettle]) {
   for (const key of Reflect.ownKeys(part.prototype)) {
     if (key === 'constructor') continue;
     if (Object.prototype.hasOwnProperty.call(Match.prototype, key)) throw new Error(`Match.${String(key)} is defined twice`);

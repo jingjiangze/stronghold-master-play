@@ -7,25 +7,37 @@ import { GEO } from '../../shared/constants.js';
 export const TICK = 1 / 30;
 /**
  * Snapshots are produced every N ticks, per watcher, by the match. At 2× real time (60 ticks per real second)
- * SNAPSHOT_EVERY = 4 ticks is 15 Hz — the 10 Hz of 2026-10-09 (6 ticks, halved from the historic 3 = 20 Hz to
- * halve the uplink of every watched field) raised back to give the *base* rate interpolation slack, while keeping
- * a lower uplink than the historic 20 Hz. SNAPSHOT_EVERY_FAST = 3 ticks (20 Hz) is what a connection gets while
- * its own link is jittery enough to need it; the client interpolates between snapshots (render/interp.js).
+ * SNAPSHOT_EVERY = 3 ticks is 20 Hz: the rate for an authority-audience watcher — a connection whose link carries
+ * both player input in and the authoritative simulation out, so its viewers see their own actions land on their own
+ * cadence. Everything that merely WATCHES a field it does not drive (a teammate peeking, a spectator, a bot or
+ * AI-taken-over field nobody is playing) takes SNAPSHOT_EVERY_IDLE = 12 ticks = 5 Hz (server/match/fields.js).
  *
- * The client's interpolation buffer trails the newest snapshot by `delay` = 100 ms (interp.js): exactly one
- * interval at 10 Hz (zero slack — any arrival jitter ran the render clock past the newest snapshot, and past
- * maxExtrapolate, 120 ms, the view froze), 1.5 intervals at 15 Hz and 2.0 at 20 Hz. The base rate therefore now
- * absorbs ~33 ms of arrival jitter of its own; the jittery-link rate remains the fallback for worse links.
- * Measured on the real buffer: at 50 ms of jitter 10 Hz extrapolated 1.5% of frames where 20 Hz extrapolated
- * 0.2%; at 75 ms it is 4.2% vs 0.6% (the table in server/match/snapRate.js).
+ * Why those two, and why per RECIPIENT rather than per field: whether a wriststream matters is decided by who is
+ * watching, not by what kind of field it is. With SP_COMBAT=server the field's own driving players watch it and get
+ * 20 Hz; the same field, watched by an eliminated teammate or a spectator, is 5 Hz to them. Splitting it the other
+ * way (by field kind) would throttle precisely the one population the higher rate exists for, while leaving
+ * spectators — who came here to watch a picture, not to drive one — at full cost.
  *
- * 15 Hz (4 ticks) and 20 Hz (3 ticks) do not nest, and no longer need to: each watcher carries its own elapsed-tick
- * counter (server/match/fields.js _emit), so a slow watcher on a field that also carries a fast one keeps its own
- * cadence instead of taking only the ticks divisible by both. See server/match/snapRate.js.
+ * There is no longer an adaptive second gear. The old fast/slow pair existed because 10 Hz was the cost floor and
+ * jitter had to be bought back at 20 Hz; 20 Hz already sits above that floor, so the client's 100 ms interpolation
+ * buffer (interp.js) covers two intervals — the jitter slack the old fast gear was bought for — and a link-dependent
+ * upgrade would only have rediscovered it. One rate per role keeps the uplink predictable, which is the real cost
+ * driver on the box's narrow pipe. History and the measurements that justified each step are in
+ * server/match/snapRate.js; SP_SNAP_RATE=slow remains the operator's one-step uplink fallback.
+ *
+ * Each watcher carries its own elapsed-tick counter (server/match/fields.js _emit), so the two rates need not nest —
+ * a mixed audience keeps its own cadence instead of taking only the ticks divisible by both.
  */
-export const SNAPSHOT_EVERY = 4;
-/** The fast rate (3 ticks = 20 Hz at 2×): what a connection gets while its link is jittery enough to need it. */
-export const SNAPSHOT_EVERY_FAST = 3;
+export const SNAPSHOT_EVERY = 3;
+/** Kept equal to the base rate: with the adaptive gear retired there is no second rate to name here. */
+export const SNAPSHOT_EVERY_FAST = SNAPSHOT_EVERY;
+/**
+ * The idle cadence (server/match/fields.js): what a watcher that does NOT drive the field gets — 12 ticks is 5 Hz
+ * at 2×. 2026-10-10: the roles are separate constants on purpose. It used to be "players' interval × 2", which
+ * quietly coupled them — 15 Hz for players meant 7.5 Hz idle, and raising players to 20 Hz would have raised the
+ * idle cost to 10 Hz at the same time. Now each stands alone.
+ */
+export const SNAPSHOT_EVERY_IDLE = 12;
 
 export const ROWS = GEO.ROWS;
 export const COLS = GEO.COLS;

@@ -42,9 +42,8 @@ export class MatchPlatform {
   handle(playerId, msg) {
     const ps = this.players.get(playerId) || this.spectators.get(playerId);
     if (!ps || ps.isBot || ps.left) return fail(ERR.NOT_IN_ROOM);
-    // a spectator seat only watches (the platform routes nothing else of it); g.bonds (step ③) is a watch-path read,
-    // g.resync its own delta chain's recovery (step ④ — a spectator gets deltas like anyone else)
-    if (ps.spectator && (!msg || (msg.t !== 'g.watch' && msg.t !== 'g.bonds' && msg.t !== 'g.resync'))) return fail(ERR.SPECTATOR);
+    // a spectator seat only watches (the platform routes nothing else of it); g.bonds (step ③) is a watch-path read
+    if (ps.spectator && (!msg || (msg.t !== 'g.watch' && msg.t !== 'g.bonds'))) return fail(ERR.SPECTATOR);
     if (this.disposed || this.ended) {
       // a battle report that crossed the match end (the last b.progress of a field) is stale: ignored, never an error
       // (DESIGN §14 — an error frame without a rid would surface as a toast in the browser)
@@ -199,8 +198,6 @@ export class MatchPlatform {
     }
     ps.lp = 0;
     ps.eliminate(passedRound);
-    if (this.teamEcon) this.econCloseAllFor(ps.playerId, 'left');
-    this.econOnEliminated(ps, passedRound);
     this.tickerText(msg('{name}博士中途退出了模拟', { name: ps.name }), FLOW_TICKER_PRIORITY);
     if (this.bossWaves && (phase === PHASE.ROUND_START || phase === PHASE.SP_DRAFT || phase === PHASE.PREP)) {
       // before the boss fight: pair the players left again (the prep preview shows the new partner / template); a

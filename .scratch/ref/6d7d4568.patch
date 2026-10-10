@@ -1,0 +1,47 @@
+commit 6d7d456896607cadbb1b68a364279ea6b929abe6
+Author: jingjiangze <1689170897@qq.com>
+Date:   Sat Oct 10 12:10:49 2026 +0800
+
+    test(match): the constants live in the baseline, so read them there
+    
+    Three assertions still read the compact hot frame after the previous commit:
+      * pool: drawnDisabledBonds / bannedChess -> read the baseline the seat was sent;
+      * realtime: the throttle cadence is asserted over the hot frames only (the baseline is one
+        extra frame per join/resync and is not throttled), while the phase set still counts every
+        frame - a short presentation phase can arrive in a baseline alone;
+      * connection: already updated in the previous commit.
+
+diff --git a/test/match/pool.test.js b/test/match/pool.test.js
+index 73a11930..5487b5ca 100644
+--- a/test/match/pool.test.js
++++ b/test/match/pool.test.js
+@@ -162,7 +162,9 @@ test('per-match disabled bonds: 3 core + 4 add-on (NORMAL+), FUNNY static + 0 +
+ 
+ test('the match pool excludes banned chess; m.public lists disabled bonds and banned chess', () => {
+   const h = makeMatch({ mode: 'coop', difficulty: 'HARD', humans: 1, bots: 1, seed: 3 }).start();
+-  const pub = h.lastBc('m.public');
++  // The per-match constants (drawnDisabledBonds / bannedChess) travel in the BASELINE, not in the compact hot frame
++  // (server/match/match/views.js) — read the baseline the seat was sent.
++  const pub = h.sent.map(([, m]) => m).find((m) => m.t === 'm.public' && m.full === true) || h.lastBc('m.public');
+   assert.equal(pub.drawnDisabledBonds.length, 7);
+   assert.ok(pub.bannedChess.length > 0);
+   for (const id of pub.bannedChess) assert.ok(!h.m.pool.has(id), `${id} should not be in the pool`);
+diff --git a/test/match/realtime.test.js b/test/match/realtime.test.js
+index bfb6bbaa..63a7f178 100644
+--- a/test/match/realtime.test.js
++++ b/test/match/realtime.test.js
+@@ -195,8 +195,12 @@ test('real-time co-op over websockets with the real simulation: 2 humans + 2 AI
+     assert.ok(s.buys >= 3 && s.placed >= 3 && s.readies >= 3, `${c.id} played its preps: ${JSON.stringify(s)}`);
+     // the SP round (NORMAL R3) gave every alive player a card
+     assert.equal(s.cards, 1, `${c.id} picked one 机变 card`);
+-    const pubs = c.log.filter((x) => x.t === 'm.public');
+-    const phases = new Set(pubs.map((x) => x.phase));
++    // The BASELINE (full: true, the constants carrier) is sent once per join/resync and is not part of the throttled
++    // stream, so the cadence below is asserted over the compact hot frames only (server/match/match/views.js). The
++    // phase set still counts every frame — a short presentation phase may arrive in a baseline alone.
++    const allPubs = c.log.filter((x) => x.t === 'm.public');
++    const pubs = allPubs.filter((x) => x.full !== true);
++    const phases = new Set(allPubs.map((x) => x.phase));
+     // (sub-100 ms presentation phases at this timer scale may fall between two throttled m.public frames)
+     for (const ph of ['INFO_CHECK', 'BAND_DRAFT', 'SP_DRAFT', 'PREP', 'COMBAT']) assert.ok(phases.has(ph), `${c.id} saw ${ph}`);
+     // m.public: throttled to ≤ 10/s (a 100 ms gap, small timer jitter tolerated)

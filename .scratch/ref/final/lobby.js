@@ -101,9 +101,7 @@
 import { randomBytes, randomInt } from 'node:crypto';
 import { ERR, MAX_SEATS, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
 import { checkLoadout, checkLoadoutOps, cultivationCharIds, checkNotOwned, checkDiyPicks } from '../shared/protocol.js';
-import { encode, isDroppable, isErrCode, linkQualityOf, sendRaw, sendSession } from './net.js';
-import { isCompressibleType } from './wsCompression.js';
-import { Matchmaking } from './matchmaking.js';
+import { encode, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
 import { getData as defaultGetData, lookup } from './data.js';
 import { Match as DefaultMatch } from './match/Match.js';
 import { KITTED_CHARS } from './sim/content/kits/index.js';
@@ -119,9 +117,6 @@ export const LOBBY_DEFAULTS = Object.freeze({
   maxMatchesPerAddr: 8,   // matches started from one client network that may run at once (0 = unlimited)
   resyncMinGapMs: 1000,   // heavy resyncs (match state / result replay) per session at most this often on repeated hellos
   soloReconnectWindowMs: null, // a dropped solo run stays resumable this long (null = data singleReconnectTime, 24 h)
-  // 快速匹配 (server/matchmaking.js): 0 = unlimited for the two caps, the two deadlines stay bounded. Defaults to the
-  // queue's own MATCHMAKING_DEFAULTS when omitted.
-  matchmaking: undefined,
 });
 
 /** Official `singleReconnectTime` (s) when the data lacks it (constData, research 01 §1). */
@@ -129,21 +124,6 @@ export const SOLO_RECONNECT_FALLBACK_SEC = 86_400;
 
 /** Display names for AI teammates (the tutorial NPCs first, then a few familiar faces). */
 export const BOT_NAMES = Object.freeze(['AI·华法琳', 'AI·阿米娅', 'AI·惊蛰', 'AI·杜宾', 'AI·凯尔希', 'AI·可露希尔']); // i18n-ignore: player names (docs/I18N.md)
-
-/** Room chat (room.chat): the length the server actually sends (the wire bound in shared/protocol.js is looser). */
-export const CHAT_MAX = 80;
-/** Room chat: the minimum gap between two lines from one session (a flood guard, not a display limit). */
-export const CHAT_MIN_GAP_MS = 1000;
-/** Control characters a chat line may never carry (terminal escapes, bells, NUL): stripped, never escaped. */
-const CHAT_CTRL = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
-
-/**
- * How much may be queued on one socket before its delta chain is dropped and it is sent complete m.public frames
- * (compression round 2, step ④ — broadcastPublic). Below the server's hard `snapDropBytes` (1 MB, where a socket is
- * terminated) on purpose: this is the early, cheap reaction that keeps the socket away from that outcome — a full
- * frame costs a few KB once, a diverged mirror costs the whole match. One recipient alone is affected.
- */
-export const PUB_CONGEST_BYTES = 128 * 1024;
 
 const OK = Object.freeze({ ok: true });
 const fail = (code, detail) => (detail ? { error: code, detail } : { error: code });
@@ -189,13 +169,11 @@ function freezeDiy(picks) {
 
 /** One room: 4 seat slots, host, difficulty, optional running match. */
 export class Room {
-  /** @param {string} code @param {'solo'|'coop'} mode @param {string} difficulty @param {number} now @param {string|null} [variant] */
-  constructor(code, mode, difficulty, now, variant = null) {
+  /** @param {string} code @param {'solo'|'coop'} mode @param {string} difficulty @param {number} now */
+  constructor(code, mode, difficulty, now) {
     this.code = code;
     this.mode = mode;
     this.difficulty = difficulty;
-    /** rule-set variant of a coop room ('xie' = 协同共竞); null ⇒ the plain mode_multi_* (DESIGN §29) */
-    this.variant = variant;
     /**
      * 「AI 队友最后选择」 (room.setAiPicksLast, GitHub #338; co-op only, off by default): the match's strategy and 机变 drafts
      * put every human seat before every AI seat (Match opts.aiPicksLast). Kept across the room's matches.
@@ -250,7 +228,6 @@ export class Room {
       hostId: this.hostId,
       mode: this.mode,
       difficulty: this.difficulty,
-      variant: this.variant,
       aiPicksLast: this.aiPicksLast,
       inMatch: !!this.match,
       seats: this.seats.map((s) => (s
@@ -290,18 +267,6 @@ export class Lobby {
     this.resyncTimers = new Map();
     /** per-network limit warnings: at most one log line per 10 s (the rest are counted) */
     this.limitLog = { at: -Infinity, suppressed: 0 };
-    /**
-     * 快速匹配 (quick match): a queue that fills ONE co-op room with exactly MAX_SEATS humans (server/matchmaking.js).
-     * The queue never creates anything itself — `allocate` below is the lobby's own room creation, so a matchmade
-     * room is an ordinary room from that point on (code, invite, spectators, AI seats all work as usual).
-     */
-    this.matchmaking = new Matchmaking({
-      now,
-      send: (session, msg) => { if (session && session.connected) sendSession(session, msg); },
-      allocate: (sessions, difficulty) => this.allocateMatch(sessions, difficulty),
-      available: (session) => !!session && session.connected && !session.roomCode && !session.pendingResult,
-      options: this.opts.matchmaking,
-    });
   }
 
   /** @param {string} code @returns {Room | null} */
@@ -318,7 +283,7 @@ export class Lobby {
       for (const s of r.seats) if (s && !s.left) (s.isBot ? bots++ : humans++);
       spectators += r.spectators.length;
     }
-    return { rooms: this.rooms.size, matches, humans, bots, spectators, queue: this.matchmaking.stats() };
+    return { rooms: this.rooms.size, matches, humans, bots, spectators };
   }
 
   // ---------------------------------------------------------------------------------------------------
@@ -339,8 +304,7 @@ export class Lobby {
         session.notice = null;
       }
       if (session.pendingResult) {
-        // These frames are the match's m.public / m.result, kept encoded — both are in the compression whitelist.
-        for (const frame of session.pendingResult) if (frame) sendRaw(session.ws, frame, { compress: true });
+        for (const frame of session.pendingResult) if (frame) sendRaw(session.ws, frame);
         session.pendingResult = null;
       }
       return;
@@ -382,13 +346,8 @@ export class Lobby {
       case 'room.loadout': return this.loadout(session, msg);
       case 'room.ownership': return this.ownership(session, msg);
       case 'room.diy': return this.diy(session, msg);
-      case 'room.chat': return this.chat(session, msg);
       case 'room.spectate': return this.spectate(session, msg);
       case 'room.removeSpectator': return this.removeSpectator(session, msg);
-      // 快速匹配 (server/matchmaking.js): a queue that fills one room with exactly MAX_SEATS humans
-      case 'queue.join': return this.matchmaking.join(session, msg);
-      case 'queue.cancel': return this.matchmaking.cancel(session);
-      case 'queue.accept': return this.matchmaking.accept(session, msg);
       default:
         if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGame(session, msg);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
@@ -398,9 +357,6 @@ export class Lobby {
   /** The session's socket closed. @param {import('./net.js').Session} session */
   onDisconnect(session) {
     this.clearResync(session.playerId); // the next resume resyncs immediately
-    // 快速匹配: a queued player who drops out of the queue; `available` already refuses them, this frees the slot now
-    // (and tells the rest of their offer, so nobody waits for a deadline they cannot meet)
-    if (this.matchmaking.has(session.playerId)) this.matchmaking.drop(session.playerId, 'disconnected');
     const room = this.roomOf(session);
     // a solo run may be resumed within singleReconnectTime (24 h); everything else keeps the registry's window
     session.resumeWindowMs = room && room.match && room.mode === 'solo' ? this.soloResumeWindowMs() : null;
@@ -440,9 +396,7 @@ export class Lobby {
   // room.* handlers
   // ---------------------------------------------------------------------------------------------------
 
-  create(session, { mode, difficulty, variant }) {
-    // 快速匹配: creating a room leaves the queue (and, if an offer was open, tells the others at once)
-    if (this.matchmaking.has(session.playerId)) this.matchmaking.cancel(session);
+  create(session, { mode, difficulty }) {
     const cur = this.roomOf(session);
     if (cur && cur.match) return fail(ERR.ROOM_STARTED, 'leave your running match first');
     if (this.rooms.size >= this.opts.maxRooms) return fail(ERR.INTERNAL, 'too many rooms');
@@ -458,7 +412,7 @@ export class Lobby {
     const code = this.genCode();
     if (!code) return fail(ERR.INTERNAL, 'no room code available');
     if (cur) this.removeMember(cur, session.playerId);
-    const room = new Room(code, mode, difficulty, this.now(), variant ?? null);
+    const room = new Room(code, mode, difficulty, this.now());
     room.ownerKey = key;
     room.seats[0] = this.humanSeat(0, session);
     room.hostId = session.playerId;
@@ -472,8 +426,6 @@ export class Lobby {
   }
 
   join(session, { code }) {
-    // 快速匹配: joining a room by code leaves the queue as well
-    if (this.matchmaking.has(session.playerId)) this.matchmaking.cancel(session);
     const norm = String(code).trim().toUpperCase();
     const room = norm.length === ROOM_CODE_LEN ? this.rooms.get(norm) : undefined;
     if (!room) return fail(ERR.ROOM_NOT_FOUND);
@@ -493,38 +445,6 @@ export class Lobby {
     if (!room.hostId) room.hostId = session.playerId;
     this.broadcastState(room);
     return OK;
-  }
-
-  /**
-   * 快速匹配's allocate (server/matchmaking.js): create ONE co-op room for a matched party and seat every session.
-   * Runs synchronously inside the queue's commit, so a refusal here breaks the offer and everyone keeps their place.
-   * The room it makes is an ordinary room from this point on — code, invite, spectators and AI seats all behave.
-   * @param {object[]} sessions
-   * @param {string} difficulty
-   * @returns {{ code: string } | { error: string, detail?: string }}
-   */
-  allocateMatch(sessions, difficulty) {
-    if (!Array.isArray(sessions) || sessions.length !== MAX_SEATS) return fail(ERR.BAD_TARGET, 'a matchmade room needs exactly MAX_SEATS players');
-    if (this.rooms.size >= this.opts.maxRooms) return fail(ERR.INTERNAL, 'too many rooms');
-    for (const s of sessions) {
-      // the queue only offers sessions that were available; re-check, because a commit is the moment they must be
-      if (!s || s.roomCode || s.pendingResult) return fail(ERR.ALREADY, 'a player left the queue');
-      if (this.opts.maxRoomsPerAddr > 0 && s.limitKey && this.countRooms((r) => r.ownerKey === s.limitKey) >= this.opts.maxRoomsPerAddr) {
-        this.limitWarn(`room limit (${this.opts.maxRoomsPerAddr}) reached for ${s.addr}`);
-        return fail(ERR.RATE, 'too many rooms from your network');
-      }
-    }
-    const code = this.genCode();
-    if (!code) return fail(ERR.INTERNAL, 'no room code available');
-    const room = new Room(code, 'coop', difficulty, this.now(), null);
-    for (let i = 0; i < sessions.length; i++) room.seats[i] = this.humanSeat(i, sessions[i]);
-    room.hostId = sessions[0].playerId;
-    room.ownerKey = sessions[0].limitKey || null;
-    this.rooms.set(code, room);
-    for (const s of sessions) { s.roomCode = code; s.notice = null; s.pendingResult = null; }
-    this.log.info(`[lobby] ${code} matchmade (coop/${difficulty}, ${sessions.length} humans)`);
-    this.broadcastState(room);
-    return { code };
   }
 
   leave(session) {
@@ -770,39 +690,6 @@ export class Lobby {
     return OK;
   }
 
-  /**
-   * room.chat (房间与局内文字聊天): one text line, broadcast to the whole room — its lobby and its running match alike,
-   * players and spectators both. In a room only: the lobby itself has no channel, so a session without one is refused
-   * (NOT_IN_ROOM) rather than silently dropped. One line per second per session (RATE). The text is stripped of control
-   * characters, trimmed and clipped to CHAT_MAX, so a client can neither push terminal escapes nor flood the frame.
-   * Nothing is stored — a room is the only channel, and a client that joins later sees only what comes after it.
-   * @param {import('./net.js').Session} session
-   * @param {{ text?: unknown }} msg
-   */
-  chat(session, msg) {
-    const room = this.roomOf(session);
-    if (!room) return fail(ERR.NOT_IN_ROOM, 'not in a room');
-    const now = this.now();
-    if (now - (session.lastChatAt || 0) < CHAT_MIN_GAP_MS) return fail(ERR.RATE, 'chat too fast');
-    session.lastChatAt = now;
-    const raw = typeof msg?.text === 'string' ? msg.text : '';
-    const text = raw.replace(CHAT_CTRL, '').trim().slice(0, CHAT_MAX);
-    if (!text) return fail(ERR.BAD_MSG, 'empty message');
-    const seat = room.seatOf(session.playerId);
-    const spectator = room.spectatorOf(session.playerId);
-    this.broadcastRoom(room, {
-      t: 'room.chat',
-      playerId: session.playerId,
-      // the seat's name is authoritative (a seat may be renamed); a session's own is the fallback for a spectator
-      name: seat?.name || spectator?.name || session.name || '',
-      seat: seat ? seat.seat : -1,
-      isSpectator: !seat && !!spectator,
-      text,
-      at: now,
-    });
-    return OK;
-  }
-
   /** Extra fields of every `welcome` (net.js): the operators a 自选 slot may field (shared/diy.js `kitted`). */
   welcomeInfo() {
     return { diyKitted: KITTED_CHARS };
@@ -837,7 +724,7 @@ export class Lobby {
         roomCode: room.code,
         mode: room.mode,
         difficulty: room.difficulty,
-        modeId: modeIdFor(room.mode, room.difficulty, room.variant),
+        modeId: modeIdFor(room.mode, room.difficulty),
         // 「AI 队友最后选择」 (GitHub #338): fixed for the match
         aiPicksLast: room.mode !== 'solo' && room.aiPicksLast === true,
         seats,
@@ -851,13 +738,6 @@ export class Lobby {
         now: this.now,
         send: (playerId, msg) => (ctx.live ? this.matchSend(room, ctx, playerId, msg) : false),
         broadcast: (msg) => { if (ctx.live) this.matchBroadcast(room, ctx, msg); },
-        // The watcher's own link, for the adaptive snapshot rate (server/match/snapRate.js): the ws RTT samples
-        // server/net.js collected while this socket was being streamed to. Null for a bot, a departed player or a
-        // socket that never carried a battle frame — the match then keeps the slow rate for that watcher.
-        linkOf: (playerId) => {
-          const session = this.registry.byId(playerId);
-          return session && session.ws ? linkQualityOf(session.ws) : null;
-        },
         onEnd: (summary) => this.onMatchEnd(room, ctx, summary),
       });
       ctx.match = match;
@@ -942,30 +822,20 @@ export class Lobby {
       if (session.pubCap > 0) {
         let data = compact;
         if (session.pubBonds > 0 || session.pubDelta > 0) {
-          // Congestion fallback (step ④): this socket is queueing, so drop its delta chain — it gets a COMPLETE frame
-          // now and stays on complete frames until the queue drains. A delta is only safe while every frame ahead of
-          // it has landed; without this, a slow recipient's picture would keep diverging while its frames got ever
-          // smaller, which is the one failure mode more compression makes worse. Per recipient on purpose: one slow
-          // client must not drag everyone else back to full frames.
-          const queued = Number(session.ws && session.ws.bufferedAmount) || 0;
-          const crowded = queued > PUB_CONGEST_BYTES;
-          if (crowded && session.pubDelta > 0) ctx.match.resetPublicDelta(session.playerId);
           let view;
           try {
-            view = ctx.match.publicViewFor(session.playerId, { full: crowded, bonds: session.pubBonds > 0, delta: session.pubDelta > 0 });
+            view = ctx.match.publicViewFor(session.playerId, { full: false, bonds: session.pubBonds > 0, delta: session.pubDelta > 0 });
           } catch (e) { this.log.error(`[lobby] ${room.code} publicViewFor`, e); }
           if (view === null) continue; // a delta with nothing new for this recipient (step ④)
           if (view) data = encode(view) || compact;
         }
-        // The hot m.public is broadcast here, not unicast: it must carry the same deflate flag a unicast frame gets,
-        // or the largest single stream on the wire stays uncompressed.
-        sendRaw(session.ws, data, { compress: isCompressibleType(msg && msg.t) });
+        sendRaw(session.ws, data);
         continue;
       }
       if (fullData === null) {
         try { fullData = encode(ctx.match.publicView()); } catch (e) { this.log.error(`[lobby] ${room.code} full publicView`, e); }
       }
-      if (fullData != null) sendRaw(session.ws, fullData, { compress: isCompressibleType(msg && msg.t) });
+      if (fullData != null) sendRaw(session.ws, fullData);
     }
     ctx.lastPublic = compact;
     ctx.lastPublicFull = fullData;
@@ -1039,8 +909,7 @@ export class Lobby {
       return;
     }
     const frames = this.replayFor(room, session.playerId);
-    // The replay is the match's m.public + m.result, already encoded — both compressible (see wsCompression.js).
-    if (frames) for (const frame of frames) sendRaw(session.ws, frame, { compress: true });
+    if (frames) for (const frame of frames) sendRaw(session.ws, frame);
   }
 
   clearResync(playerId) {
@@ -1310,13 +1179,8 @@ export class Lobby {
     const data = encode(msg);
     if (data == null) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg && msg.t}`); return null; }
     const droppable = isDroppable(msg);
-    // The match's public state (m.public) is broadcast here, not unicast — it must carry the same
-    // permessage-deflate flag send() gives a unicast frame, or the single largest stream stays uncompressed.
-    const compress = isCompressibleType(msg && msg.t);
     for (const session of this.memberSessions(room)) {
-      // A session that did not declare the compact-public capability (`hello.pub`) gets the FULL encoding; the others
-      // get the compact one. Both directions still need the deflate flag.
-      sendRaw(session.ws, fullData && !(session.pubCap > 0) ? fullData : data, { droppable, compress });
+      sendRaw(session.ws, fullData && !(session.pubCap > 0) ? fullData : data, { droppable });
     }
     return data;
   }

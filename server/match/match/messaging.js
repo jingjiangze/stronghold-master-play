@@ -102,7 +102,10 @@ export class MatchMessaging {
     }
     this._pubDirty = false;
     let view;
-    try { view = this.publicView(); } catch (e) { this.reportError('publicView', e); return; }
+    // The hot frame is compact (views.js): the per-match constants travel in the baseline (`full: true`) that _resync
+    // sends on every join / reconnect / spectator-add, and not again. A client that did not declare `hello.pub` never
+    // merges, so the lobby hands it the full frame instead — see Lobby.broadcastRoom.
+    try { view = this.publicView({ full: false }); } catch (e) { this.reportError('publicView', e); return; }
     const { serverNow, ...rest } = view;
     const json = JSON.stringify(rest);
     if (!force && json === this._lastPubJson) return;

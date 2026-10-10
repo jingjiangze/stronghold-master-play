@@ -1,6 +1,8 @@
 // render/interp.js — snapshot interpolation buffer for battle rendering (pure logic, no PIXI / DOM).
 //
-// The server streams `b.snap` at 15 Hz real time (20 Hz on a jittery link; server/match/snapRate.js); snapshot time `t` is GAME seconds and combat runs at 2×
+// The server streams `b.snap` per watcher: 20 Hz for a field's own players, 5 Hz for anyone who only watches it
+// (server/match/snapRate.js, server/match/fields.js _emit; the link-adaptive gear was retired 2026-10-11); snapshot
+// time `t` is GAME seconds and combat runs at 2×
 // real time (DESIGN §4), so the game clock advances `rate` ≈ 2 game-s per real second. The buffer:
 //   * keeps ~2 s of snapshots (each indexed id → tuple once, at push time),
 //   * estimates `rate` from arrival times (sliding window, clamped, default 2),

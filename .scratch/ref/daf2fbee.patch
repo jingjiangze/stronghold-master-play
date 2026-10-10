@@ -1,0 +1,627 @@
+commit daf2fbee6e89cc28769c081eba3993c4d5d6b114
+Author: jingjiangze <1689170897@qq.com>
+Date:   Sat Oct 10 23:26:10 2026 +0800
+
+    perf: per-recipient bond strip in the compact public frame
+    
+    Step ③ of docs/ws-link-compression-next.md: a client that declares hello.pubBonds receives the hot m.public frame with players[].bonds only for the 1-2 players its screen can show (the field it watches or scouts, its own live field, else the remembered scope - the SETTLE result box keeps the unite/boss field's players after watchers was cleared), every other list travels as an explicit [] and is refreshed with one g.bonds -> m.bonds round trip (new optional C2S/S2C entries; the lobby refuses g.bonds without the capability and never sends m.bonds to a silent connection). The baseline, the shared compact frame and every frame for a client without the capability are byte-for-byte content-unchanged. Client: hello.pubBonds, actions.bonds on popup open, m.bonds written into the mirror player entry.
+
+diff --git a/public/js/main.js b/public/js/main.js
+index f0064fd6..67a4e389 100644
+--- a/public/js/main.js
++++ b/public/js/main.js
+@@ -232,6 +232,16 @@ function wireNet() {
+     });
+     maybeFinishRestore();
+   });
++  net.on('m.bonds', (msg) => {
++    // step ③ (g.bonds): the on-demand bond list of a player whose hot-frame entry is stripped — written into the
++    // mirror's player entry, so the strip, the detail chips and the popup read it like any streamed list.
++    const playerId = typeof msg.playerId === 'string' ? msg.playerId : null;
++    const bonds = Array.isArray(msg.bonds) ? msg.bonds : null;
++    if (!playerId || !bonds) return;
++    const pub = store.get().match?.public;
++    if (!pub || !Array.isArray(pub.players) || !pub.players.some((p) => p && p.playerId === playerId)) return;
++    store.patch('match', { public: { ...pub, players: pub.players.map((p) => (p && p.playerId === playerId ? { ...p, bonds } : p)) } });
++  });
+   net.on('m.private', (msg) => { matchAt = Date.now(); store.patch('match', { private: payload(msg) }); });
+   net.on('m.field', (msg) => store.patch('match', { field: payload(msg) }));
+   net.on('m.result', (msg) => {
+diff --git a/public/js/net.js b/public/js/net.js
+index 388b5e95..afb9fa4b 100644
+--- a/public/js/net.js
++++ b/public/js/net.js
+@@ -365,7 +365,9 @@ export class Net {
+     // `pub: 1` declares that this client MERGES an m.public frame into its mirror instead of replacing it, and resets
+     // the mirror when the frame is a baseline (`full: true`). The server then drops the per-match constants from the
+     // hot broadcast (server/match/match/views.js) and sends this client the full frame only as a baseline / replay.
+-    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION, pub: 1 };
++    // `pubBonds: 1` (step ③): a hot frame may carry only the bonds of the 1–2 players on screen; opening a bond popup
++    // for anyone else refreshes with one g.bonds (m.bonds writes the mirror entry, see the handler in main.js).
++    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION, pub: 1, pubBonds: 1 };
+     let token = null;
+     try { token = this.getToken(); } catch { token = null; }
+     if (typeof token === 'string' && token.length > 0 && token.length <= 64) msg.token = token;
+diff --git a/public/js/screens/game.js b/public/js/screens/game.js
+index dfcdd24f..f9d91910 100644
+--- a/public/js/screens/game.js
++++ b/public/js/screens/game.js
+@@ -1315,7 +1315,15 @@ function MatchScreen() {
+   // (the runner's field meta is taken before they deploy); a battle sends no bench (a prep scout does: ownerBoard)
+   const popOps = cc && battleRunner && field?.local && bondOpen && bondOpen.ownerId !== myId ? battleRunner.ownerOps(bondOpen.ownerId, field.fieldId) : null;
+   const bondPop = popupView({ open: bondOpen, pub, priv, myId, field, units: popOps, live: liveLayers });
+-  const openBond = (id, ownerId, from) => { setBondOpen((b) => toggleBond(b, id, ownerId, from)); audio.sfx('click', { volume: 0.4 }); };
++  const openBond = (id, ownerId, from) => {
++    const next = toggleBond(bondOpen, id, ownerId, from);
++    // step ③: a hot frame only carries the bonds of the players on screen — opening a popup for anyone else asks the
++    // server once per open (g.bonds ⇄ m.bonds; main.js writes the answer into the mirror entry) so the popup can never
++    // be left showing an empty or outdated list (ui/watchBonds.js popupView reads the mirror).
++    if (next && ownerId !== myId) actions.bonds(ownerId);
++    setBondOpen(next);
++    audio.sfx('click', { volume: 0.4 });
++  };
+   const watchingNow = combat ? (watching || field?.fieldId || home) : watching;
+   const shopOpen = showShop && !collapsed;
+   const ufShown = !!(selEntry && editable && !facing && !drag && showPrep && ufGeo);
+diff --git a/public/js/ui/gameActions.js b/public/js/ui/gameActions.js
+index 5b1cdbc4..b19294ab 100644
+--- a/public/js/ui/gameActions.js
++++ b/public/js/ui/gameActions.js
+@@ -69,6 +69,10 @@ export const actions = {
+   emote: (id) => act('g.emote', { id }, { quiet: true }),
+   // `playerId`: the player tapped in the team panel (a shared field shows two) — what an eliminated viewer follows
+   watch: (fieldId, playerId = null) => act('g.watch', typeof playerId === 'string' && playerId ? { fieldId, playerId } : { fieldId }, { sfx: 'tab' }),
++  // the bonds of a player whose list the hot frames strip (WS compression round 2, step ③): the server answers one
++  // unicast m.bonds (main.js writes it into the mirror's player entry). Best effort and quiet — it is a refresh of a
++  // popup the user just opened, so a refusal must not toast.
++  bonds: (playerId) => act('g.bonds', { playerId }, { sfx: false, quiet: true }),
+   autoplay: (on) => act('g.autoplay', { on }),
+   // solo battles only (ui/matchStatus.js pauseAvailable): m.public.paused follows
+   pause: (on) => act('g.pause', { on: !!on }, { sfx: on ? 'click' : 'confirm' }),
+diff --git a/server/lobby.js b/server/lobby.js
+index 21f62eb5..87de480c 100644
+--- a/server/lobby.js
++++ b/server/lobby.js
+@@ -795,21 +795,46 @@ export class Lobby {
+ 
+   /** Match broadcast; the latest m.public and a broadcast m.result are also kept for the replay. */
+   matchBroadcast(room, ctx, msg) {
+-    // m.public goes out compact (views.js). Two things still need the full frame: a session that did not declare
+-    // `hello.pub` (it replaces the view instead of merging, so a compact frame would erase the constants), and the
+-    // replay a resume gets. Build it only when such a session is actually present — an all-capable room pays nothing.
++    // m.public goes out compact (views.js) and, for sessions that declared the newer capabilities, per recipient
++    // (broadcastPublic). Every other frame keeps the encode-once path of broadcastRoom.
++    if (msg.t === 'm.public' && ctx.match) { this.broadcastPublic(room, ctx, msg); return; }
++    const data = this.broadcastRoom(room, msg);
++    if (data != null && msg.t === 'm.result') ctx.sharedResult = data;
++  }
++
++  /**
++   * m.public, one frame per recipient (WS compression round 2, step ③ — the doc's documented cost of it is giving up
++   * broadcastRoom's shared encoding on the hot public frame, ~1 encode/s/seat). A session that did not declare
++   * `hello.pub` gets the FULL view (`full: true`, publicView()), built only when such a session is present; a session
++   * that declared it gets the shared compact frame, and one that also declared `hello.pubBonds` its own per-recipient
++   * frame (Match.publicViewFor: only the 1–2 players its screen shows keep their bonds, the rest travel as an explicit
++   * `[]` and are refreshed with g.bonds). A full frame is never stripped. ctx.lastPublic stays the complete compact
++   * frame: the replay a resume gets must stand alone (a per-recipient or — step ④ — delta frame could not).
++   */
++  broadcastPublic(room, ctx, msg) {
++    if (room.disposed) return;
++    const compact = encode(msg);
++    if (compact == null) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg && msg.t}`); return; }
+     let fullData = null;
+-    if (msg.t === 'm.public' && ctx.match) {
+-      for (const session of this.memberSessions(room)) {
+-        if (session.pubCap > 0) continue;
++    for (const session of this.memberSessions(room)) {
++      if (session.pubCap > 0) {
++        let data = compact;
++        if (session.pubBonds > 0 || session.pubDelta > 0) {
++          let view;
++          try { view = ctx.match.publicViewFor(session.playerId, { full: false, bonds: session.pubBonds > 0 }); } catch (e) { this.log.error(`[lobby] ${room.code} publicViewFor`, e); }
++          if (view === null) continue; // a delta frame with nothing new for this recipient (step ④)
++          if (view) data = encode(view) || compact;
++        }
++        sendRaw(session.ws, data);
++        continue;
++      }
++      if (fullData === null) {
+         try { fullData = encode(ctx.match.publicView()); } catch (e) { this.log.error(`[lobby] ${room.code} full publicView`, e); }
+-        break;
+       }
++      if (fullData != null) sendRaw(session.ws, fullData);
+     }
+-    const data = this.broadcastRoom(room, msg, { fullData });
+-    if (data == null) return;
+-    if (msg.t === 'm.public') { ctx.lastPublic = data; ctx.lastPublicFull = fullData; }
+-    else if (msg.t === 'm.result') ctx.sharedResult = data;
++    ctx.lastPublic = compact;
++    ctx.lastPublicFull = fullData;
+   }
+ 
+   /**
+@@ -914,8 +939,12 @@ export class Lobby {
+       this.removeMember(room, session.playerId);
+       return OK;
+     }
+-    // a spectator only watches (header): nothing else of it ever reaches the match
+-    if (msg.t !== 'g.watch' && room.spectatorOf(session.playerId)) return fail(ERR.SPECTATOR);
++    // step ③ of the compression round (docs/ws-link-compression-next.md): g.bonds exists only for a connection that
++    // declared hello.pubBonds — an old or third-party client never sends it (shared/protocol.js), and m.bonds is never
++    // sent to a connection that did not ask for this channel.
++    if (msg.t === 'g.bonds' && !(session.pubBonds > 0)) return fail(ERR.BAD_MSG, 'g.bonds requires hello.pubBonds');
++    // a spectator only watches (header): nothing else of it ever reaches the match; g.bonds (step ③) belongs to watching
++    if (msg.t !== 'g.watch' && msg.t !== 'g.bonds' && room.spectatorOf(session.playerId)) return fail(ERR.SPECTATOR);
+     let res;
+     try {
+       res = room.match.handle(session.playerId, msg);
+diff --git a/server/match/Match.js b/server/match/Match.js
+index 27c6a921..15b4a51e 100644
+--- a/server/match/Match.js
++++ b/server/match/Match.js
+@@ -376,6 +376,13 @@ export class Match {
+      * player again (its prep board, its battle field) — else the first player still in — instead of its own empty board.
+      */
+     this.watchPref = new Map();
++    /**
++     * The last bond scope read for a recipient (compression round 2, step ③): playerId → the players whose bonds its
++     * screen could show, remembered by views.js `_bondScopeFor` while `watchers` was live, so the frame after a phase end
++     * (watchers cleared at settle) still carries the field's 1–2 players. startRound clears it with `watchers`.
++     * @type {Map<string, string[]>}
++     */
++    this._bondScope = new Map();
+     this.lastResults = new Map();
+     this.unitePlan = null;
+     /** 联防 outcome for the SETTLE view: { through, helpers, leakers, losses } (settle()), null when no 联防 resolved */
+diff --git a/server/match/match/intents.js b/server/match/match/intents.js
+index b88b8772..11b36993 100644
+--- a/server/match/match/intents.js
++++ b/server/match/match/intents.js
+@@ -38,6 +38,8 @@ export class MatchIntents {
+       case 'g.emote': return this.emote(ps, msg.id);
+       // playerId: the player tapped (a shared field names two) — the watch preference (item 56)
+       case 'g.watch': return this.watch(ps, msg.fieldId, msg.playerId ?? null);
++      // the bonds of a player whose list this connection's hot frames strip (compression round 2, step ③)
++      case 'g.bonds': return this.sendBonds(ps, msg.playerId);
+       case 'g.autoplay': return this.setAutoplay(ps, !!msg.on);
+       case 'g.pause': return this.setPause(ps, !!msg.on);
+       // the stats the board's units start their next battle with (the detail card in prep, user playtest #4 item 7)
+diff --git a/server/match/match/phases.js b/server/match/match/phases.js
+index 1f7a4cac..c04a422e 100644
+--- a/server/match/match/phases.js
++++ b/server/match/match/phases.js
+@@ -254,6 +254,7 @@ export class MatchPhases {
+     this.round = r;
+     this.fields = [];
+     this.watchers.clear();
++    this._bondScope.clear(); // step ③: a new round starts from the own board, never from last round's teammate
+     this.unitePlan = null;
+     this.uniteResultView = null;
+     this.sp = null;
+diff --git a/server/match/match/platform.js b/server/match/match/platform.js
+index 454583b2..bfbbbe61 100644
+--- a/server/match/match/platform.js
++++ b/server/match/match/platform.js
+@@ -42,8 +42,8 @@ export class MatchPlatform {
+   handle(playerId, msg) {
+     const ps = this.players.get(playerId) || this.spectators.get(playerId);
+     if (!ps || ps.isBot || ps.left) return fail(ERR.NOT_IN_ROOM);
+-    // a spectator seat only watches (the platform routes nothing else of it)
+-    if (ps.spectator && (!msg || msg.t !== 'g.watch')) return fail(ERR.SPECTATOR);
++    // a spectator seat only watches (the platform routes nothing else of it); g.bonds (step ③) is a watch-path read
++    if (ps.spectator && (!msg || (msg.t !== 'g.watch' && msg.t !== 'g.bonds'))) return fail(ERR.SPECTATOR);
+     if (this.disposed || this.ended) {
+       // a battle report that crossed the match end (the last b.progress of a field) is stale: ignored, never an error
+       // (DESIGN §14 — an error frame without a rid would surface as a toast in the browser)
+diff --git a/server/match/match/views.js b/server/match/match/views.js
+index 6234e47c..6c5ccdbb 100644
+--- a/server/match/match/views.js
++++ b/server/match/match/views.js
+@@ -4,7 +4,7 @@
+ // coming enemies; in a boss round's prep on the player's half of the boss field).
+ // Installed on Match.prototype by server/match/Match.js (a method container: never instantiated; `this` is the match).
+ 
+-import { PHASE, GEO } from '../../../shared/constants.js';
++import { PHASE, GEO, ERR } from '../../../shared/constants.js';
+ import { boardOrder, pieceDir } from '../board.js';
+ import { bondList, offBondCounts } from '../bondsMeta.js';
+ import { cardView } from '../choices.js';
+@@ -12,6 +12,7 @@ import { bountySpawns, previewOf } from '../waves.js';
+ import { timelineAt } from '../fields.js';
+ import { bossFieldPlacement } from '../finalAssault.js';
+ import { battleProgress } from '../../sim/spec.js';
++import { OK, fail } from './common.js';
+ 
+ /**
+  * The phase-scoped pockets of m.public: a compact frame (`full: false`) publishes one only while its phase applies (or
+@@ -120,7 +121,7 @@ export class MatchViews {
+         // nobody can watch an eliminated player (g.watch refuses them, they have no field) and the result screen reads
+         // m.result's own bonds, so their layers would only cost every m.public bytes for the rest of the match
+         // (the mode-off bonds with members included, `off: true`, as in m.private — bondsMeta.offBondCounts)
+-        bonds: ps.alive ? bondList(this.gd, ps.bondsView(), { off: offBondCounts(ps.gd || this.gd, ps) }) : [],
++        bonds: this._bondsOf(ps),
+         fieldId: this.fieldOf(ps),
+         status: this.statusOf(ps),
+         autoplay: ps.autoplay,
+@@ -182,6 +183,81 @@ export class MatchViews {
+     return v;
+   }
+ 
++  /**
++   * The m.public frame ONE recipient gets on the hot path (WS compression round 2, steps ③/④; the lobby calls this per
++   * session instead of publicView — server/lobby.js broadcastPublic): the shared compact view, with every bond list the
++   * recipient's screen cannot show stripped to `[]` when it declared `hello.pubBonds`. `bonds` is the client's
++   * capability, not its identity: a recipient that did not declare it gets the shared compact frame untouched.
++   *
++   * The strip follows the doc's rule (1–2 players: the field / board on screen): `_bondScopeFor` is the server's reading
++   * of the client's own strip owner (public/js/ui/watchBonds.js). The stripped lists travel as an explicit `[]` (never an
++   * omitted key a merging client would keep stale) and are refreshed with one g.bonds ⇄ m.bonds round trip when the
++   * client opens a popup for a player it has no live list for; a full baseline is NEVER stripped, so a client that
++   * cannot ask for them still receives every player's bonds.
++   *
++   * @param {string} playerId the recipient (a player seat or a spectator seat; any id when the match does not know it)
++   * @param {{ full?: boolean, bonds?: boolean }} [opts]
++   */
++  publicViewFor(playerId, { full = false, bonds = false } = {}) {
++    const v = this.publicView({ full });
++    if (full || !bonds) return v;
++    const scope = this._bondScopeFor(playerId);
++    for (const p of v.players) if (p && !scope.includes(p.playerId)) p.bonds = [];
++    return v;
++  }
++
++  /**
++   * The players whose bonds the recipient's screen can show (see publicViewFor): the field it watches or the board it
++   * scouts (`watchers`; g.watch names the player of a shared field), else its own live field, else the scope it had when
++   * `watchers` was last live — the map is read after a phase end cleared `watchers` (settle.js), so the SETTLE result box
++   * of a 联防 / boss round still carries the field's 1–2 players —, else the player it follows (an eliminated human /
++   * spectator seat, watchPref) and itself at last. startRound clears the remembered scope with `watchers`, so a new
++   * round never keeps the last one's teammate. The scope is remembered on every live read, which is what makes the
++   * SETTLE fallback work without touching the watcher lifecycle.
++   * @param {string} playerId
++   * @returns {string[]}
++   */
++  _bondScopeFor(playerId) {
++    const watched = this.watchers.get(playerId);
++    let live = null;
++    if (typeof watched === 'string' && watched.startsWith('n:')) {
++      const pid = watched.slice(2);
++      if (this.players.has(pid)) live = [pid];
++    } else if (watched) {
++      const f = this.fields.find((x) => x.fieldId === watched);
++      if (f && Array.isArray(f.players)) live = f.players.slice();
++    }
++    if (live) { this._bondScope.set(playerId, live); return live; }
++    const own = this.fields.find((f) => Array.isArray(f.players) && f.players.includes(playerId));
++    if (own) return own.players.slice();
++    const last = this._bondScope.get(playerId);
++    if (last) return last;
++    const ps = this.players.get(playerId) || this.spectators.get(playerId);
++    if (ps && this._follows(ps)) {
++      const target = this._watchTargetOf(ps);
++      if (target) return [target];
++    }
++    return [playerId];
++  }
++
++  /** The players[].bonds payload of a player — one expression, shared by publicView and the m.bonds answer (g.bonds). */
++  _bondsOf(ps) {
++    return ps.alive ? bondList(this.gd, ps.bondsView(), { off: offBondCounts(ps.gd || this.gd, ps) }) : [];
++  }
++
++  /**
++   * g.bonds { playerId } (step ③): the bonds of a player whose list the requester's hot frames strip — an off-screen
++   * player, the case the on-demand channel exists for. One unicast m.bonds to the requester (never broadcast: each
++   * connection refreshes its own popup); an unknown id is refused. The payload is players[].bonds' own, so the client
++   * can write it into its mirror entry unchanged.
++   */
++  sendBonds(ps, playerId) {
++    const target = this.players.get(playerId);
++    if (!target) return fail(ERR.BAD_TARGET, 'no such player');
++    this.sendTo(ps.playerId, { t: 'm.bonds', playerId, bonds: this._bondsOf(target) });
++    return OK;
++  }
++
+   /**
+    * m.public.fields[].progress: { killed, resolved, total, done } (teammates' waiting UI). `resolved` is the HUD
+    * capsule's numerator — the field's own scheduled enemies knocked out or leaked (Battle.resolved / the reported
+diff --git a/server/net.js b/server/net.js
+index 37d8b948..1c222aad 100644
+--- a/server/net.js
++++ b/server/net.js
+@@ -122,6 +122,18 @@ export class Session {
+      * comes back with an older/newer client is re-evaluated rather than inheriting the previous socket's answer.
+      */
+     this.pubCap = 0;
++    /**
++     * @type {number} the per-recipient bonds capability (`hello.pubBonds`, compression round 2 step ③): > 0 = the
++     * lobby may strip the bonds of the players its screen cannot show from this connection's hot frames, and it may ask
++     * with g.bonds (the lobby refuses that intent otherwise, server/lobby.js). 0 = every frame keeps all bonds.
++     */
++    this.pubBonds = 0;
++    /**
++     * @type {number} the delta capability (`hello.pubDelta`, compression round 2 step ④): > 0 = the connection merges
++     * delta hot frames (with the periodic full anchor), so server/match/match/views.js may send it a frame that carries
++     * only what changed. 0 = every hot frame is complete (the `pub: 1` shape).
++     */
++    this.pubDelta = 0;
+     /** @type {string} client address of the latest connection (logging) */
+     this.addr = '?';
+     /** @type {string | null} per-network limit key of the latest connection (null = not limited), see clientAddress */
+@@ -668,8 +680,10 @@ export class Network {
+     session.lastSeen = now;
+     session.addr = conn.ip;
+     session.limitKey = conn.key;
+-    // The m.public capability is per socket: a resume re-declares it (see Session.pubCap).
++    // The m.public capability is per socket: a resume re-declares it (see Session.pubCap / pubBonds / pubDelta).
+     session.pubCap = Number.isInteger(msg.pub) && msg.pub > 0 ? msg.pub : 0;
++    session.pubBonds = Number.isInteger(msg.pubBonds) && msg.pubBonds > 0 ? msg.pubBonds : 0;
++    session.pubDelta = Number.isInteger(msg.pubDelta) && msg.pubDelta > 0 ? msg.pubDelta : 0;
+ 
+     let extra = null;
+     try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
+diff --git a/shared/protocol.js b/shared/protocol.js
+index 17903935..c2d8f446 100644
+--- a/shared/protocol.js
++++ b/shared/protocol.js
+@@ -381,8 +381,18 @@ export const C2S = {
+   // `pub`: the m.public shape this client understands (server/match/match/views.js publicView). 1 = it merges a
+   // compact/incremental frame into its local mirror and honours `full`, so the server may drop the per-match constant
+   // fields from the hot broadcast. Absent (old client, third-party client) ⇒ full frame every time, exactly as before.
+-  // Additive optional field on purpose: PROTOCOL_VERSION stays strictly checked (server/net.js).
+-  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), pub: (v) => v == null || isInt(v, 0, 100), $optional: ['token', 'version', 'pub'] },
++  // `pubBonds` (WS compression round 2, step ③): the client can take a hot frame whose `players[].bonds` only carry the
++  // players its screen can show, and refreshes a player it has no live list for with one `g.bonds` ⇄ `m.bonds` round trip.
++  // `pubDelta` (step ④): the client merges a DELTA hot frame — a top-level key / a `players[]` entry travels only when it
++  // changed since the previous frame this client got, a cleared key travels as an explicit null, and a periodic full
++  // anchor heals a frame the client missed. Absent `pubBonds` / `pubDelta` ⇒ exactly the frames of `pub` alone.
++  // Additive optional fields on purpose: PROTOCOL_VERSION stays strictly checked (server/net.js).
++  hello: {
++    name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64),
++    version: (v) => v == null || isInt(v, 0, 1e6), pub: (v) => v == null || isInt(v, 0, 100),
++    pubBonds: (v) => v == null || isInt(v, 0, 100), pubDelta: (v) => v == null || isInt(v, 0, 100),
++    $optional: ['token', 'version', 'pub', 'pubBonds', 'pubDelta'],
++  },
+   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
+   'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
+   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
+@@ -439,6 +449,10 @@ export const C2S = {
+   // playerId: the player tapped in the team panel (a 联防 / boss pair field shows two) — what an eliminated viewer or a
+   // spectator seat follows from then on (Match.watchPref; community report of 2026-10-06, item 56)
+   'g.watch': { fieldId: (v) => isStr(v, 32), playerId: isId, $optional: ['playerId'] },
++  // the bonds of a player whose list the requester's hot frames do not carry (WS compression round 2, step ③: an
++  // off-screen player, `players[].bonds` stripped) — answered with ONE m.bonds { playerId, bonds } to the requester.
++  // Sent by clients that declared `hello.pubBonds`; the lobby refuses it from a session that did not (server/lobby.js).
++  'g.bonds': { playerId: isId },
+   'g.autoplay': { on: isBool },
+   // solo pause (official PauseUp / ResumeUp, DESIGN §14): freezes the running battle (field clock, deadlines, the
+   // browser's local runner) — solo matches only (co-op ⇒ WRONG_PHASE), only while a battle runs; m.public.paused
+@@ -474,6 +488,8 @@ export const S2C = [
+   'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
+   // m.unitStats { seq, round, units: [unitStatsEntry] } — the answer to g.unitStats (the requester only)
+   'm.unitStats',
++  // m.bonds { playerId, bonds } — the answer to g.bonds (the requester only; `bonds` is players[].bonds' own payload)
++  'm.bonds',
+   // client-side combat (DESIGN §14): b.start { battleId, fieldId, kind, spec, authoritative, startAt, serverNow, elapsed,
+   // speed, watch? } · b.pool { hp, max, teamLp, acked: { [fieldId]: cumulative boss damage counted } } ·
+   // b.end { battleId, fieldId, reason }
+diff --git a/test/match/fuzz.test.js b/test/match/fuzz.test.js
+index f9f072a1..510ef1c0 100644
+--- a/test/match/fuzz.test.js
++++ b/test/match/fuzz.test.js
+@@ -34,6 +34,8 @@ function randomIntent(rng, m, ps) {
+     case 'g.ready': return { t, ready: rng() < 0.4 };
+     case 'g.emote': return { t, id: rng.pick(EMOTES) };
+     case 'g.watch': return { t, fieldId: rng.pick(['n:p_0', 'n:p_1', 'n:ai_0', 'u', 'b1', 'b2', 'zz', '']) };
++    // the on-demand bond read (WS compression round 2, step ③): a known player most of the time, a stranger sometimes
++    case 'g.bonds': return { t, playerId: rng() < 0.8 && m.players.size ? rng.pick([...m.players.keys()]) : 'nobody' };
+     case 'g.autoplay': return { t, on: rng() < 0.05 };
+     case 'g.pause': return { t, on: rng() < 0.5 };
+     default: return { t };
+diff --git a/test/match/ws-public-compact.test.js b/test/match/ws-public-compact.test.js
+index 1b6a1776..fb555f74 100644
+--- a/test/match/ws-public-compact.test.js
++++ b/test/match/ws-public-compact.test.js
+@@ -17,7 +17,13 @@
+ //   7. the compact frame's null-clearing rule (server/match/match/views.js COMPACT_NULL_POCKETS): after a unite round
+ //      reaches SETTLE the mirror holds `uniteResult`, and the LATER SETTLE that resolves no unite carries an explicit
+ //      `uniteResult: null`, so the merged mirror clears the ended pocket instead of popping the previous unite's
+-//      result box and sound (public/js/screens/game.js reads `pub?.uniteResult` at every SETTLE).
++//      result box and sound (public/js/screens/game.js reads `pub?.uniteResult` at every SETTLE);
++//   8. step ③ of the next compression round (docs/ws-link-compression-next.md): a session that declared `hello.pubBonds`
++//      receives a per-recipient hot frame — only the 1–2 players its screen can show keep their bonds, everyone else
++//      travels as an explicit `[]` (never stale); the baseline and a frame for a session without the capability are
++//      content-identical to today's, and `g.bonds` answers one unicast `m.bonds` with players[].bonds' own payload
++//      (a player seat or a spectator seat; refused by the lobby without the capability, refused by the match for an
++//      unknown player id).
+ //
+ // Run: node --test test/match/ws-public-compact.test.js
+ //
+@@ -34,7 +40,8 @@
+ 
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
+-import { PHASE } from '../../shared/constants.js';
++import { PHASE, ERR } from '../../shared/constants.js';
++import { validateC2S, S2C } from '../../shared/protocol.js';
+ import { DATA, makeMatch, give, legalTileFor, chessOfTier } from './harness.js';
+ import { createBattleFromSpec, compactResult } from '../../server/sim/spec.js';
+ import { Lobby, Room } from '../../server/lobby.js';
+@@ -350,7 +357,7 @@ test('capability routing: a session without hello.pub gets the full encoding, pu
+   // net.js `hello` sets session.pubCap = Number.isInteger(msg.pub) && msg.pub > 0 ? msg.pub : 0; sendRaw needs an
+   // OPEN socket ({ readyState: 1, bufferedAmount, send }) — a recording stub stands in for the ws.
+   const socket = (out) => ({ readyState: 1, bufferedAmount: 0, send: (data) => { out.push(data); } });
+-  const session = (playerId, pubCap, out) => ({ playerId, pubCap, connected: true, roomCode: 'TEST', ws: socket(out) });
++  const session = (playerId, pubCap, out, extra = {}) => ({ playerId, pubCap, connected: true, roomCode: 'TEST', ws: socket(out), ...extra });
+   const frames = { p_0: [], p_1: [] };
+   const sessions = new Map([['p_0', session('p_0', 0, frames.p_0)], ['p_1', session('p_1', 1, frames.p_1)]]);
+   const errors = [];
+@@ -363,6 +370,7 @@ test('capability routing: a session without hello.pub gets the full encoding, pu
+   const room = new Room('TEST', 'coop', 'NORMAL', 0);
+   room.seats[0] = { seat: 0, playerId: 'p_0', name: 'P0', isBot: false, ready: true, connected: true, left: false };
+   room.seats[1] = { seat: 1, playerId: 'p_1', name: 'P1', isBot: false, ready: true, connected: true, left: false };
++  lobby.rooms.set(room.code, room); // routeGame resolves the room through the registry (the other assertions call the seams directly)
+   const ctx = { live: true, ended: false, disposed: false, match, lastPublic: null, lastPublicFull: null, sharedResult: null, results: new Map() };
+   const compact = match.publicView({ full: false });
+   lobby.matchBroadcast(room, ctx, compact);
+@@ -394,6 +402,160 @@ test('capability routing: a session without hello.pub gets the full encoding, pu
+   lobby.matchBroadcast(room, ctx2, compact);
+   assert.equal(ctx2.lastPublicFull, null, 'no session needs the full frame: none is built');
+   for (const pid of ['p_0', 'p_1']) assert.deepEqual(JSON.parse(capFrames[pid][0]), compact, `${pid} gets the compact frame`);
++  // step ③: a session that declared hello.pubBonds gets its OWN frame — the players its screen cannot show are stripped
++  // (this room is in INFO_CHECK: no field, no watch, so each seat's screen shows its own board and only its own bonds).
++  const bondFrames = { p_0: [], p_1: [] };
++  sessions.set('p_0', session('p_0', 0, bondFrames.p_0));
++  sessions.set('p_1', session('p_1', 1, bondFrames.p_1, { pubBonds: 1 }));
++  const ctx3 = { live: true, ended: false, disposed: false, match, lastPublic: null, lastPublicFull: null, sharedResult: null, results: new Map() };
++  lobby.matchBroadcast(room, ctx3, compact);
++  const bondRow = (v, pid) => v.players.find((p) => p.playerId === pid);
++  const perBond = JSON.parse(bondFrames.p_1[0]);
++  assert.deepEqual(bondRow(perBond, 'p_1').bonds, bondRow(compact, 'p_1').bonds, 'the recipient keeps the bonds of the player on its screen');
++  assert.deepEqual(bondRow(perBond, 'p_0').bonds, [], 'every other player\'s bonds travel as an explicit empty list');
++  assert.deepEqual(bondRow(JSON.parse(bondFrames.p_0[0]), 'p_1').bonds, bondRow(match.publicView(), 'p_1').bonds, 'a session without the capability keeps all bonds (full frame)');
++  assert.deepEqual(JSON.parse(ctx3.lastPublic), compact, 'the replay record stays the complete compact frame (per-recipient frames could not stand alone)');
++  assert.equal(ctx3.lastPublicFull, bondFrames.p_0[0], 'the non-capable session got the full frame');
++  // the lobby only routes g.bonds for a session that declared hello.pubBonds (step ③ admission) — an old client that
++  // somehow sends the type is refused, a capable one reaches the match and gets its m.bonds unicast (the test match's
++  // own send path records those in h.sent, as it does for every unicast frame)
++  room.match = match;
++  const plain = sessions.get('p_0');
++  assert.equal(lobby.routeGame(plain, { t: 'g.bonds', playerId: 'p_1' }).error, ERR.BAD_MSG, 'g.bonds without hello.pubBonds is refused');
++  const capable = sessions.get('p_1');
++  const bondAnswers = () => h.sent.filter(([, msg]) => msg.t === 'm.bonds');
++  const before = bondAnswers().length;
++  assert.ok(lobby.routeGame(capable, { t: 'g.bonds', playerId: 'p_0' }).ok, 'a capable session reaches the match');
++  const after = bondAnswers();
++  assert.equal(after.length, before + 1, 'and gets exactly one answer');
++  assert.deepEqual(after[after.length - 1], ['p_1', { t: 'm.bonds', playerId: 'p_0', bonds: bondRow(match.publicView(), 'p_0').bonds }], 'the answer is players[].bonds\' own payload');
+   assert.deepEqual(errors, [], 'the broadcast path did not report an error');
+   match.dispose();
+ });
++
++test('step ③: in a shared field both halves keep their bonds, the leaker\'s own list travels as []; baseline and plain frames are untouched', () => {
++  // A 3-human unite round with a real board (same recipe as the test above plus one chess per prep): p_0 leaks, p_1 and
++  // p_2 hold the 联防 field 'u'. The doc's unit of the strip is 1–2 players — a shared field shows both halves' units,
++  // so BOTH helpers' bonds must stay while the leaker's own (not on screen) travels as an explicit [].
++  let ran = 0;
++  const h = makeMatch({
++    mode: 'coop', humans: 3, seed: 9111, fake: true, clientCombat: true,
++    script: (b) => (b.kind === 'normal' ? { leaks: { p_0: 4 } } : {}),
++    perPlayer: Object.fromEntries(['p_0', 'p_1', 'p_2'].map((pid) => [pid, {
++      tamper: (result, spec) => {
++        if (spec.kind !== 'unite') return result;
++        ran++;
++        const b = createBattleFromSpec(spec, h.m.ds, { recordEvents: false, quiet: true });
++        return compactResult(b.runToEnd(4000));
++      },
++    }])),
++  }).start();
++  const m = h.m;
++  h.autoHumans();
++  const fill = (ps) => {
++    const id = chessOfTier(1).find((x) => m.pool.has(x));
++    const tile = legalTileFor(m, ps, id);
++    if (tile) give(m, ps, id, 'board', tile);
++  };
++  h.drive(() => m.phase === PHASE.PREP && m.round === 1);
++  for (const ps of m.players.values()) if (ps.alive) fill(ps);
++  const unite = () => m.fields.find((f) => f.fieldId === 'u');
++  h.drive(() => (unite() && unite().done) || h.ended != null);
++  assert.equal(m.phase, PHASE.UNITE, 'the match is in the unite phase');
++  assert.ok(ran > 0, 'the unite field ran the real sim for its authority');
++  assert.equal(m.watchers.get('p_0'), 'u', 'the leaker is shown the unite field');
++  const full = m.publicView();
++  const plain = m.publicView({ full: false });
++  const row = (v, pid) => v.players.find((p) => p.playerId === pid);
++  // no capability field / an old client: the shared frame, content-identical to publicView({ full: false })
++  assert.deepEqual(m.publicViewFor('p_0', { full: false }), plain, 'without hello.pubBonds the frame is the shared compact one');
++  assert.deepEqual(m.publicViewFor('p_0', { full: false, bonds: false }), plain, 'and so is a declared-but-off strip');
++  // the strip: both helpers (the shared field on screen) keep everything, the leaker's own list travels as []
++  const per = m.publicViewFor('p_0', { full: false, bonds: true });
++  assert.deepEqual(per.unite, plain.unite, 'the unite plan is untouched');
++  for (const pid of ['p_1', 'p_2']) assert.deepEqual(row(per, pid).bonds, row(full, pid).bonds, `helper ${pid} keeps its bonds (the shared field shows its half)`);
++  assert.deepEqual(row(per, 'p_0').bonds, [], 'the bond list of the player not on screen travels as an explicit empty list');
++  assert.ok(row(full, 'p_1').bonds.length + row(full, 'p_2').bonds.length > 0, 'the helpers actually carry bonds (the field the doc measured at ~2/3 of the frame)');
++  // nothing but the bonds changed: strip the lists from both frames and they are equal
++  const noBonds = (v) => JSON.parse(JSON.stringify({ ...v, players: v.players.map((p) => ({ ...p, bonds: null })) }));
++  assert.deepEqual(noBonds(per), noBonds(plain), 'the per-recipient frame differs from the shared one only in players[].bonds');
++  // a helper's own frame: both halves stay (it is on the field itself) — per-recipient divergence on the same frame
++  const helperFrame = m.publicViewFor('p_1', { full: false, bonds: true });
++  assert.deepEqual(row(helperFrame, 'p_1').bonds, row(full, 'p_1').bonds);
++  assert.deepEqual(row(helperFrame, 'p_2').bonds, row(full, 'p_2').bonds);
++  assert.deepEqual(row(helperFrame, 'p_0').bonds, []);
++  assert.deepEqual(noBonds(helperFrame), noBonds(per), 'both recipients get the same frame except their bond lists');
++  // the baseline is never stripped: a client that cannot ask (no g.bonds) must still receive every list
++  const base = m.publicViewFor('p_0', { full: true, bonds: true });
++  assert.equal(base.full, true);
++  for (const pid of ['p_0', 'p_1', 'p_2']) assert.deepEqual(row(base, pid).bonds, row(full, pid).bonds, `the baseline keeps ${pid}'s bonds`);
++  m.dispose();
++});
++
++test('step ③: the strip follows the watched player, keeps its list through SETTLE (watchers cleared) and never touches an old client', () => {
++  // A normal round (server-run combat via the fake battle) with one chess per player, so players[].bonds really carries
++  // data. Walks the whole lifecycle the doc calls out: the own field -> a watched teammate -> the SETTLE after the
++  // watcher map was cleared (the remembered scope must keep the watched player's bonds for the result box).
++  const h = makeMatch({ mode: 'coop', humans: 3, seed: 42, fake: true }).start();
++  const m = h.m;
++  h.autoHumans();
++  const fill = (ps) => {
++    const id = chessOfTier(1).find((x) => m.pool.has(x));
++    const tile = legalTileFor(m, ps, id);
++    if (tile) give(m, ps, id, 'board', tile);
++  };
++  h.drive(() => m.phase === PHASE.PREP && m.round === 1);
++  for (const ps of m.players.values()) if (ps.alive) fill(ps);
++  h.drive(() => m.phase === PHASE.COMBAT || h.ended != null);
++  assert.equal(m.phase, PHASE.COMBAT, 'the normal round reached COMBAT');
++  const full = m.publicView();
++  const row = (v, pid) => v.players.find((p) => p.playerId === pid);
++  for (const pid of ['p_0', 'p_1', 'p_2']) assert.ok(row(full, pid).bonds.length > 0, `${pid} carries bonds (the strip has something to strip)`);
++  assert.equal(m.watchers.get('p_0'), 'n:p_0', 'a fighting player is shown its own field');
++  // the own field: only its own list survives (1 player — the doc's 普通场)
++  const own = m.publicViewFor('p_0', { full: false, bonds: true });
++  assert.deepEqual(row(own, 'p_0').bonds, row(full, 'p_0').bonds);
++  assert.deepEqual(row(own, 'p_1').bonds, []);
++  assert.deepEqual(row(own, 'p_2').bonds, []);
++  // 前往查看 a teammate: the watched player's list replaces the own one — the same broadcast, another recipient
++  assert.ok(m.handle('p_0', { t: 'g.watch', fieldId: 'n:p_1', playerId: 'p_1' }).ok, 'watching a teammate is accepted');
++  assert.equal(m.watchers.get('p_0'), 'n:p_1');
++  const watched = m.publicViewFor('p_0', { full: false, bonds: true });
++  assert.deepEqual(row(watched, 'p_1').bonds, row(full, 'p_1').bonds, 'the watched teammate keeps its bonds');
++  assert.deepEqual(row(watched, 'p_0').bonds, [], 'the own list is stripped while the screen shows the teammate');
++  const other = m.publicViewFor('p_1', { full: false, bonds: true });
++  assert.deepEqual(row(other, 'p_1').bonds, row(full, 'p_1').bonds, 'p_1\'s own frame still keeps p_1 (per-recipient divergence)');
++  assert.deepEqual(row(other, 'p_0').bonds, []);
++  // SETTLE: settle.js clears watchers; the remembered scope keeps the watched player's list for the result screen
++  h.drive(() => m.phase === PHASE.SETTLE || h.ended != null);
++  assert.equal(m.phase, PHASE.SETTLE, 'the round reached SETTLE');
++  assert.equal(m.watchers.size, 0, 'the watcher map is cleared at settle');
++  const settle = m.publicViewFor('p_0', { full: false, bonds: true });
++  assert.deepEqual(row(settle, 'p_1').bonds, m.publicView().players.find((p) => p.playerId === 'p_1').bonds, 'the remembered scope keeps the watched player\'s bonds at SETTLE');
++  assert.deepEqual(row(settle, 'p_0').bonds, []);
++  // an old client / no capability on the same state: the shared compact frame, untouched
++  assert.deepEqual(m.publicViewFor('p_0', { full: false }), m.publicView({ full: false }), 'a client without hello.pubBonds gets exactly the shared frame');
++  m.dispose();
++});
++
++test('step ③: g.bonds answers one m.bonds to the requester — a player seat or a spectator seat; unknown ids are refused', () => {
++  const h = makeMatch({ mode: 'coop', humans: 2, seed: 77, fake: true, spectators: ['s_1'] }).start();
++  const m = h.m;
++  assert.equal(validateC2S({ t: 'g.bonds', playerId: 'p_1' }), null, 'g.bonds validates');
++  assert.equal(validateC2S({ t: 'g.bonds' }), 'bad field playerId', 'the player id is required');
++  assert.equal(validateC2S({ t: 'g.bonds', playerId: 42 }), 'bad field playerId', 'and must be an id');
++  assert.ok(S2C.includes('m.bonds'), 'm.bonds is documented in the S2C catalogue');
++  assert.equal(validateC2S({ t: 'hello', name: 'x', pub: 1, pubBonds: 1, pubDelta: 1 }), null, 'the new hello capabilities stay optional and valid');
++  const want = m.publicView().players.find((p) => p.playerId === 'p_1').bonds;
++  assert.ok(m.handle('p_0', { t: 'g.bonds', playerId: 'p_1' }).ok, 'a player seat may ask');
++  const answer = h.sent.filter(([pid, msg]) => pid === 'p_0' && msg.t === 'm.bonds').pop();
++  assert.deepEqual(answer && answer[1], { t: 'm.bonds', playerId: 'p_1', bonds: want }, 'the answer is players[].bonds\' own payload, unicast');
++  assert.equal(m.handle('p_0', { t: 'g.bonds', playerId: 'nobody' }).error, ERR.BAD_TARGET, 'an unknown player is refused');
++  assert.equal(h.sent.filter(([, msg]) => msg.t === 'm.bonds').length, 1, 'a refusal sends nothing');
++  // a spectator seat watches like an eliminated player: its popups read the same mirror entry, so it may ask too
++  assert.ok(m.handle('s_1', { t: 'g.bonds', playerId: 'p_0' }).ok, 'a spectator seat may ask');
++  const toSpectator = h.sent.filter(([pid, msg]) => pid === 's_1' && msg.t === 'm.bonds');
++  assert.equal(toSpectator.length, 1, 'exactly one answer to the spectator');
++  assert.deepEqual(toSpectator[0][1].bonds, m.publicView().players.find((p) => p.playerId === 'p_0').bonds);
++  m.dispose();
++});

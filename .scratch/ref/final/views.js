@@ -155,10 +155,6 @@ export class MatchViews {
    * the hot frame costs its compressed size in EVERY frame — that is what makes this worth doing at all.
    */
   publicView({ full = true } = {}) {
-    // 协同经济 (DESIGN §28/§29): m.public.econ exists only while the rule set is on (the client's capability probe)
-    const econ = full ? this.econPublicView() : null;
-    // 救援 (DESIGN §29): the settle window (open/closed, who may donate, who is waiting) — null outside 促融共竞
-    const revival = full ? this.revivalView() : null;
     const v = {
       t: 'm.public',
       // `full` marks a baseline: the client drops its mirror and starts from this frame. A compact frame never has it.
@@ -167,21 +163,6 @@ export class MatchViews {
       round: this.round,
       deadline: this.deadline,
       serverNow: this.sched.now(),
-      // The per-match constants below never change: a compact (hot) frame omits them and the client keeps them from
-      // its baseline. master-play additions (econ / revival) are part of that rule set, so they ride the same way.
-      ...(full ? {
-        modeId: this.modeId,
-        difficulty: this.difficulty,
-        stageId: this.stageId,
-        factions: this.factions.slice(),
-        disabledBonds: [...new Set([...this.disabledBonds, ...this.staticInactiveBonds])].sort(),
-        drawnDisabledBonds: this.disabledBonds.slice(),
-        bannedChess: this.bannedChess.slice(),
-        bossId: this.bossId,
-        hiddenBossId: this.hiddenBossId,
-      } : null),
-      ...(econ ? { econ } : {}),
-      ...(revival ? { revival } : {}),
       bossRound: this.gd.bossRound,
       hiddenRound: this.gd.hiddenRound,
       spRound: this.gd.spRounds().includes(this.round),
@@ -195,8 +176,6 @@ export class MatchViews {
         isBot: ps.isBot,
         connected: ps.isBot || (ps.connected && !ps.left),
         alive: ps.alive,
-        // 救援 (DESIGN §29): LP spent, still rescuable this settle — the row shows 等待救援 rather than 已淘汰
-        ...(this.revivalEnabled ? { pendingDeath: !!ps.pendingDeath, revivalReason: ps.revivalUnavailableReason || null } : {}),
         lp: Math.max(0, ps.lp),
         bandId: ps.bandId,
         shopLevel: ps.shop.level,
@@ -312,40 +291,14 @@ export class MatchViews {
     this._pubSent.set(playerId, v);
     if (!prev || this.pubSync !== 'delta') { this._pubState.delete(playerId); return v; }
     const now = this.sched.now();
-    const st = this._pubState.get(playerId) || { frames: 0, at: now, seq: 0 };
-    // NOTE: the frame number is stamped only once we know this frame will actually be SENT (below). Stamping it before
-    // the diff would make every frame differ from its predecessor by `seq` alone, so nothing would ever be "unchanged"
-    // — every recipient would be sent a frame on every tick, which is an idle heartbeat, and the user's rule is that
-    // no change must mean no frame at all.
-    const seq = (Number.isInteger(st.seq) ? st.seq : 0) + 1;
+    const st = this._pubState.get(playerId) || { frames: 0, at: now };
     if (st.frames >= this.pubAnchorFrames || now - st.at >= this.pubAnchorMs) {
-      this._pubState.set(playerId, { frames: 0, at: now, seq });
-      v.seq = seq;
+      this._pubState.set(playerId, { frames: 0, at: now });
       return v;
     }
     const d = deltaPublicView(prev, v);
-    if (!d) {
-      // Nothing changed (and no anchor due): send NOTHING, and let the chain keep the number it last used. A gap in
-      // the numbers still means a frame was lost; a quiet minute means no frames, which is the intended behaviour.
-      this._pubState.set(playerId, { ...st, seq: seq - 1 });
-      return null;
-    }
-    d.seq = seq;
-    this._pubState.set(playerId, { frames: st.frames + 1, at: st.at, seq });
+    this._pubState.set(playerId, d ? { frames: st.frames + 1, at: st.at } : st);
     return d;
-  }
-
-  /**
-   * Throw away a recipient's delta chain so its NEXT frame is a complete one (`publicViewFor` sees no previous payload
-   * and sends the whole view). This is the server half of the gap self-heal: the client that detects a missing number
-   * asks for a resync instead of waiting for the periodic anchor, so recovery takes one frame rather than up to
-   * PUB_DELTA_ANCHOR_MS. Also used when a recipient's socket starts to queue — see server/lobby.js broadcastPublic.
-   * Unknown recipients and the 'full' mode are unaffected (both already send complete frames).
-   * @param {string} playerId
-   */
-  resetPublicDelta(playerId) {
-    this._pubSent.delete(playerId);
-    this._pubState.delete(playerId);
   }
 
   /**

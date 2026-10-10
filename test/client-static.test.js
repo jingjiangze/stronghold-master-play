@@ -439,7 +439,12 @@ describe('net.js', () => {
     assert.ok(ws().last('ping'), 'latency probe before hello');
     net.setName('  凯尔希  ');
     const hello = ws().last('hello');
-    assert.deepEqual({ ...hello, rid: 0 }, { t: 'hello', rid: 0, name: '凯尔希', version: PROTOCOL_VERSION, token: 'tok-1' });
+    // `pub` / `pubBonds` / `pubDelta` are the client's m.public capability declaration (WS compression round 2):
+    // it merges a frame into its mirror, accepts per-recipient bonds, and accepts delta frames. A server that does
+    // not know them ignores them; pinning them here means dropping one silently changes the wire contract.
+    assert.deepEqual({ ...hello, rid: 0 }, {
+      t: 'hello', rid: 0, name: '凯尔希', version: PROTOCOL_VERSION, token: 'tok-1', pub: 1, pubBonds: 1, pubDelta: 1,
+    });
     assert.equal(net.status, 'handshaking');
     ws().recv({ t: 'welcome', rid: hello.rid, playerId: 'p_1', token: 't', name: '凯尔希', serverNow: Date.now() });
     assert.equal(net.status, 'online');

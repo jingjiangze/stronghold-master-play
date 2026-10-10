@@ -99,6 +99,10 @@ export const actions = {
   emote: (id) => act('g.emote', { id }, { quiet: true }),
   // `playerId`: the player tapped in the team panel (a shared field shows two) — what an eliminated viewer follows
   watch: (fieldId, playerId = null) => act('g.watch', typeof playerId === 'string' && playerId ? { fieldId, playerId } : { fieldId }, { sfx: 'tab' }),
+  // the bonds of a player whose list the hot frames strip (WS compression round 2, step ③): the server answers one
+  // unicast m.bonds (main.js writes it into the mirror's player entry). Best effort and quiet — it is a refresh of a
+  // popup the user just opened, so a refusal must not toast.
+  bonds: (playerId) => act('g.bonds', { playerId }, { sfx: false, quiet: true }),
   autoplay: (on) => act('g.autoplay', { on }),
   // solo battles only (ui/matchStatus.js pauseAvailable): m.public.paused follows
   pause: (on) => act('g.pause', { on: !!on }, { sfx: on ? 'click' : 'confirm' }),

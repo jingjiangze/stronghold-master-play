@@ -157,10 +157,13 @@ test('server-run combat: the spectate throttle thins a spectator\'s snapshots bu
   const specSnaps = h.allTo(S, 'b.snap');
   const p0Snaps = h.allTo('p_0', 'b.snap');
   assert.ok(specSnaps.length > 0 && p0Snaps.length > 0, 'both get snapshots');
-  // The field's own player keeps its full cadence; the spectator takes frames at twice its own interval, so
-  // strictly fewer, and at least one.
+  // The field's own player drives it and takes the 20 Hz player cadence (SNAPSHOT_EVERY = 3 ticks); the spectator
+  // watches a field it does not drive and takes the 5 Hz idle cadence (SNAPSHOT_EVERY_IDLE = 12 ticks). The ratio is
+  // therefore ~4, not the ~2 of the old "twice your own interval" rule — the two are independent constants now, so
+  // raising the player rate no longer drags the idle one up with it (server/sim/constants.js). Measured: 164 / 44.
   assert.ok(p0Snaps.length > specSnaps.length, `p_0 ${p0Snaps.length} snapshots > spectator ${specSnaps.length}`);
-  assert.ok(specSnaps.length >= Math.floor(p0Snaps.length / 2) - 1, 'the spectator is thinned, not starved');
+  assert.ok(specSnaps.length >= Math.floor(p0Snaps.length / 5) - 1, 'the spectator is thinned, not starved');
+  assert.ok(specSnaps.length <= Math.ceil(p0Snaps.length / 3) + 1, 'and the idle cadence really is coarser than the player one');
   // Events are never thinned: a spectator's b.ev messages are fewer (one per its own frame), but each carries the
   // events drained since the previous one. End the field so the parked batch is flushed — then both watchers must
   // hold exactly the same events.
