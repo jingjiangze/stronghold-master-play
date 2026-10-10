@@ -186,6 +186,11 @@ function backToLobby() {
 
 function onWelcome(msg) {
   identity.saveToken(msg.token);
+  // The seat's routing credential (absent from a server without the routing layer): remembered per tab, bound to
+  // this token, and presented on the WS URL of the next reconnect — it lets a blue/green flip route the socket
+  // back to the process that owns the session. Never the token itself, and never in localStorage.
+  if (typeof msg.cred === 'string') identity.saveCred(msg.token, msg.cred);
+  else identity.clearCred();
   const prev = store.get();
   const prevId = prev.me.playerId;
   const name = typeof msg.name === 'string' && msg.name ? msg.name : prev.me.name;

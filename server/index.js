@@ -65,7 +65,7 @@ export async function startServer(opts = {}) {
 
   // The process-wide singleton serves the default data dir; a custom dir (tests) gets its own copy.
   const data = opts.dataDir ? loadData(dataDir, { log }) : getData({ dir: dataDir, log });
-  const { registry, lobby, network } = createSessionStack(opts, { data, log });
+  const { registry, lobby, network, directory } = createSessionStack(opts, { data, log });
   // content packs (docs/PACKS.md): scanned now — the start log names them — and again whenever their folders change
   const packs = createPackRegistry({ publicDir, dataDir, packsDir }, { log });
   packs.refresh(true);
@@ -79,7 +79,15 @@ export async function startServer(opts = {}) {
   server.on('clientError', answerClientError);
   // 传输层压缩（SP_WS_COMPRESSION=on|off，默认 off）：只压战斗帧，见 server/wsCompression.js
   const wsCompression = resolveWsCompression(opts.wsCompression ?? process.env.SP_WS_COMPRESSION ?? 'off');
-  const wss = attachWebSocket(server, { network, log, wsCompression });
+  // Session-ownership routing step 3: an inbound `/ws?cred=…` whose credential resolves to the OTHER slot is handed
+  // to that slot's loopback port before this process accepts it. `ownPort` is a getter — the port is only known
+  // after the bind below succeeds, and until then no hand-off is attempted. The peers come from the `route` option
+  // the directory was built with (SP_ROUTE_PEERS). Null with the routing layer off: nothing changes.
+  const wss = attachWebSocket(server, {
+    network, log, wsCompression,
+    peers: directory?.peers ?? {},
+    ownPort: () => (typeof server.address() === 'object' && server.address() ? server.address().port : undefined),
+  });
 
   // The address actually bound. The default may fall back to IPv4; the returned host and url follow that.
   let boundHost;

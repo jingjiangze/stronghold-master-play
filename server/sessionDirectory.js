@@ -29,6 +29,33 @@ export function tokenHash(token) {
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
 const unb64u = (s) => Buffer.from(String(s), 'base64url');
 
+/** Shape of a credential as it may appear in a URL: `v1.<base64url payload>.<base64url signature>`. */
+const CREDENTIAL_RE = /^v1\.[A-Za-z0-9_-]{1,1024}\.[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * The routing credential an upgrade URL carries (`/ws?cred=v1.<payload>.<sig>`), or null.
+ *
+ * Why the URL: `hello` is strictly validated, so an unknown field there would make an OLD server reject the whole
+ * handshake — the credential has to ride where an old server simply does not look. Parsing never trusts the value
+ * (the signature is verified later) and never throws; anything that is not the exact shape is treated as absent.
+ * @param {string | null | undefined} url the raw request target (`req.url`)
+ * @returns {string | null}
+ */
+export function routeCredentialFromUrl(url) {
+  if (typeof url !== 'string') return null;
+  const q = url.indexOf('?');
+  if (q < 0) return null;
+  const query = url.slice(q + 1).split('#')[0];
+  for (const pair of query.split('&')) {
+    const eq = pair.indexOf('=');
+    if (eq < 0 || pair.slice(0, eq) !== 'cred') continue;
+    let value = pair.slice(eq + 1);
+    try { value = decodeURIComponent(value); } catch { return null; }
+    return CREDENTIAL_RE.test(value) ? value : null;
+  }
+  return null;
+}
+
 /**
  * A routing credential: `v1.<payload>.<sig>`. The payload names the OWNING instance, its slot and the
  * generation at issue time — never a port, never the token. Anyone may read it (it travels in the WS URL), so
@@ -64,10 +91,10 @@ export class SessionDirectory {
    * @param {{
    *   instanceId: string, slot: string, secret: string,
    *   backend?: { load: () => object, save: (obj: object) => void }, file?: string | null,
-   *   leaseMs?: number, credentialMs?: number, now?: () => number, log?: object,
+   *   peers?: Record<string, number>, leaseMs?: number, credentialMs?: number, now?: () => number, log?: object,
    * }} opts
    */
-  constructor({ instanceId, slot, secret, backend = null, file = null, leaseMs = 60_000, credentialMs = 24 * 60 * 60 * 1000, now = Date.now, log = null }) {
+  constructor({ instanceId, slot, secret, backend = null, file = null, peers = {}, leaseMs = 60_000, credentialMs = 24 * 60 * 60 * 1000, now = Date.now, log = null }) {
     if (!instanceId) throw new TypeError('SessionDirectory: instanceId required');
     if (!slot) throw new TypeError('SessionDirectory: slot required');
     if (!secret) throw new TypeError('SessionDirectory: secret required (SP_ROUTE_SECRET)');
@@ -79,6 +106,11 @@ export class SessionDirectory {
     this.now = now;
     this.log = log;
     this.file = file;
+    /**
+     * The other slots' LOOPBACK ports ("<slot>=<port>", from SP_ROUTE_PEERS) — the only places step 3 will hand an
+     * upgrade to; nothing else in a box knows them and a client can never name one. @type {Record<string, number>}
+     */
+    this.peers = peers && typeof peers === 'object' ? { ...peers } : {};
     this.backend = backend || (file ? fileBackend(file) : memoryBackend());
     /** @type {Map<string, {sid:string, instanceId:string, slot:string, generation:number, leaseUntil:number, recoverUntil:number, roomCode:string|null, updatedAt:number}>} */
     this.entries = new Map();

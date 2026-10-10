@@ -49,7 +49,7 @@ Every frame is JSON text, `{ t, rid?, …fields }`.
 
 | direction | messages | handled in |
 |---|---|---|
-| client → server | `hello` (name, reconnect token) → `welcome`; `ping` → `pong` | `server/net.js` |
+| client → server | `hello` (name, reconnect token) → `welcome` (token, plus an optional `cred` routing credential); `ping` → `pong` | `server/net.js` |
 | | `room.*`: create, join, ready, difficulty, AI seats, kick, start, the 干员调配 loadout, 干员持有 ownership, 自选编队 picks, spectating | `server/lobby.js` |
 | | `g.*`: match intents — buy, refresh, freeze, level up, sell, move, equip, Arts, rewards, 机变 choices, ready, emotes, watching, pause … | `server/match/match/intents.js` → `server/match/player/` |
 | | `b.progress`, `b.result`: the battle reports of the authoritative browser | `server/match/match/reports.js` |
@@ -61,6 +61,9 @@ Every frame is JSON text, `{ t, rid?, …fields }`.
   validates every message against `C2S` and refuses anything unknown; the handlers never trust the client.
 - Messages meant for people (`m.toast`, `m.ticker`) carry a message id and its parameters, so each client shows them in
   its own language (`shared/i18n.js` `wireMessage`).
+- Session-ownership routing (phase 1, opt-in via `SP_ROUTE_*`): `welcome.cred` is a signed, expiring credential for the
+  seat (never the token), the client keeps it per tab and presents it as `/ws?cred=…`, and `server/sessionDirectory.js`
+  is the shared directory that says which slot owns the session — so a blue/green flip does not strand a reconnect.
 - The exact view shapes: DESIGN §8.3 and META §5.
 
 ## 3. The directory layout

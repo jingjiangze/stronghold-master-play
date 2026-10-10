@@ -7,6 +7,9 @@
 //   so a background tab whose timers the browser throttles to ~1/min is not mistaken for dead.
 // - On every (re)connect, once a player name is known, sends `hello {name, token, version}`;
 //   the session is "online" after `welcome`.
+// - The seat's routing credential (`welcome.cred`) rides on the socket URL (`/ws?cred=…`) — never in `hello`,
+//   whose schema is strictly validated, and never the token. After a blue/green flip the reconnect therefore
+//   reaches the process that owns the session instead of the new active slot (see server/sessionDirectory.js).
 // - `request(t, fields)` adds a `rid` and resolves on the matching `ok` (or any reply carrying the
 //   rid), rejects with a NetError on `error` or after REQUEST_TIMEOUT_MS. Requests made while
 //   reconnecting are queued and flushed after `welcome` (still bound by their timeout).
@@ -24,7 +27,9 @@
 // the reconnect token lives in sessionStorage (survives reloads of this tab) plus a short list of
 // recent tokens in localStorage (resume after closing/reopening the tab). `identity.init()` asks
 // the other live tabs over a BroadcastChannel which tokens they hold, so a second or duplicated tab
-// of the same browser becomes a separate player instead of hijacking another tab's session.
+// of the same browser becomes a separate player instead of hijacking another tab's session. The seat's
+// ROUTING CREDENTIAL also lives in sessionStorage — per tab, like the token it is bound to, never in
+// localStorage (it names a signed seat on one box, not a browser-wide identity) and never in `hello`.
 //
 // Shared modules are imported relatively: in the browser '../../shared/x.js' from /js/ resolves
 // to /shared/x.js (URL resolution clamps at the root); under Node it resolves to <repo>/shared.
@@ -108,6 +113,26 @@ export function defaultWsUrl(loc = globalThis.location) {
   return `${loc.protocol === 'https:' ? 'wss' : 'ws'}://${loc.host}/ws`;
 }
 
+/** Shape of a routing credential (`welcome.cred`): v1.<base64url payload>.<base64url signature>. */
+const CREDENTIAL_RE = /^v1\.[A-Za-z0-9_-]{1,1024}\.[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * The URL a connect should open: the seat's routing credential rides in a query parameter. It cannot go into
+ * `hello` (that message is strictly validated, so an unknown field would make an OLD server reject the whole
+ * handshake), while an old server simply ignores what it does not know in the URL. The reconnect TOKEN never goes
+ * in the URL — the query carries only the signed credential (no token, no port: the server resolves the slot from
+ * its own directory). No usable credential ⇒ the URL is returned byte-identical, so an old client's request line
+ * is exactly the one it always sent.
+ * @param {string} url @param {string | null | undefined} cred
+ * @returns {string}
+ */
+export function withRouteCredential(url, cred) {
+  const u = String(url || '');
+  if (typeof cred !== 'string' || !CREDENTIAL_RE.test(cred)) return u;
+  if (u.includes('?') || u.includes('#')) return u; // a URL that already carries something is left alone
+  return `${u}?cred=${cred}`;
+}
+
 const WS_OPEN = 1;
 const WS_CONNECTING = 0;
 
@@ -120,6 +145,7 @@ export class Net {
    * @param {string} [opts.url] socket URL (default: derived from location at connect time)
    * @param {any} [opts.WebSocket] WebSocket constructor (default: globalThis.WebSocket)
    * @param {() => (string|null)} [opts.getToken] reconnect-token provider for `hello`
+   * @param {() => (string|null)} [opts.getCred] routing-credential provider for the WS URL (see withRouteCredential)
    * @param {() => number} [opts.now] epoch clock (what the wire carries, and the base of the server-time estimate)
    * @param {() => number} [opts.monotonicNow] elapsed-time clock for RTT (defaults to `opts.now` for injected clocks)
    * @param {() => boolean} [opts.isVisible] whether latency probes belong to a visible page
@@ -130,6 +156,7 @@ export class Net {
     this.url = opts.url || null;
     this.WS = opts.WebSocket || null;
     this.getToken = typeof opts.getToken === 'function' ? opts.getToken : () => null;
+    this.getCred = typeof opts.getCred === 'function' ? opts.getCred : () => null;
     this.now = opts.now || (() => Date.now());
     // RTT is measured on an elapsed-time clock: an NTP correction or a manual clock change mid-probe must not turn a
     // 40 ms link into a negative or a 30-minute reading (the epoch clock is still what the wire carries).
@@ -235,12 +262,17 @@ export class Net {
     this._clearTimer('_reconnectTimer', 'clearTimeout');
     this.retryAt = 0;
     const WS = this.WS || globalThis.WebSocket;
-    const url = this.url || defaultWsUrl();
+    // The seat's credential rides on the URL (never in `hello`, never the token) and is read afresh on every
+    // attempt: the token this tab uses can change between attempts, and a credential bound to the old one is
+    // dropped by identity.getCred().
+    let url = this.url || defaultWsUrl();
+    try { url = withRouteCredential(url, this.getCred()); } catch { /* a throwing provider must not stop the connect */ }
     let ws;
     try {
       ws = new WS(url);
     } catch (err) {
-      console.warn('[net] cannot create WebSocket', err);
+      // The error is logged WITHOUT the URL: it may carry the routing credential.
+      console.warn('[net] cannot create WebSocket', err?.name || 'error');
       this._scheduleReconnect();
       return;
     }
@@ -725,6 +757,7 @@ export class Net {
 
 const K_NAME = 'sp.name';
 const K_TOKEN = 'sp.token';      // sessionStorage: this tab's token
+const K_CRED = 'sp.cred';        // sessionStorage: this tab's routing credential, bound to its token
 const K_RECENT = 'sp.tokens';    // localStorage: this browser's recent tokens, most recent first
 const K_ENTERED = 'sp.entered';  // sessionStorage: this tab passed the title screen
 const RECENT_MAX = 4;
@@ -751,6 +784,7 @@ function sset(s, k, v) { try { if (s) s.setItem(k, v); } catch { /* quota / priv
 function sdel(s, k) { try { if (s) s.removeItem(k); } catch { /* ignore */ } }
 
 const isToken = (t) => typeof t === 'string' && t.length > 0 && t.length <= TOKEN_MAX_LEN;
+const isCred = (c) => typeof c === 'string' && CREDENTIAL_RE.test(c);
 
 /**
  * Short, stable hash of a token (FNV-1a, hex) so tabs never broadcast tokens in clear.
@@ -803,6 +837,27 @@ export function createIdentity(deps = {}) {
     }
   };
   const writeRecent = (list) => sset(local, K_RECENT, JSON.stringify([...new Set(list)].slice(0, RECENT_MAX)));
+
+  /** The token this tab would use right now (init() not finished ⇒ its own stored one). */
+  const tokenOf = () => {
+    if (current) return current;
+    if (initialized) return null;
+    const own = sget(session, K_TOKEN);
+    return isToken(own) ? own : null;
+  };
+
+  /** The stored credential and the token hash it belongs to ({ h, c }), or null when nothing usable is stored. */
+  const readCred = () => {
+    const raw = sget(session, K_CRED);
+    if (!raw) return null;
+    try {
+      const o = JSON.parse(raw);
+      if (!o || typeof o !== 'object' || typeof o.h !== 'string' || !isCred(o.c)) return null;
+      return { h: o.h, c: o.c };
+    } catch {
+      return null;
+    }
+  };
 
   const post = (msg) => {
     try { channel?.postMessage({ ...msg, from: tabId }); } catch { /* channel closed */ }
@@ -862,6 +917,10 @@ export function createIdentity(deps = {}) {
           else if (own) sdel(session, K_TOKEN); // duplicated tab: the copied token belongs to a live tab
           // A welcome may already have set a token while we were waiting: that one wins.
           if (!current) current = pick;
+          // A credential belongs to exactly ONE token: one stored for another token is dropped, never carried
+          // (a duplicated tab copied it together with the token it does not get to use).
+          const cred = readCred();
+          if (cred && (current == null || cred.h !== tokenHash(current))) sdel(session, K_CRED);
           initialized = true;
           return current;
         });
@@ -873,12 +932,7 @@ export function createIdentity(deps = {}) {
     /** @param {string} name */
     saveName: (name) => sset(local, K_NAME, String(name)),
     /** Token for `hello` (null ⇒ new session). Before init() only this tab's own token is used. */
-    getToken() {
-      if (current) return current;
-      if (initialized) return null;
-      const own = sget(session, K_TOKEN);
-      return isToken(own) ? own : null;
-    },
+    getToken() { return tokenOf(); },
     /** @param {string} token from `welcome` */
     saveToken(token) {
       if (!isToken(token)) return;
@@ -886,11 +940,33 @@ export function createIdentity(deps = {}) {
       sset(session, K_TOKEN, token);
       writeRecent([token, ...readRecent().filter((t) => t !== token)]);
     },
-    /** Forget this tab's token (e.g. the server said the session is invalid). */
+    /**
+     * Remember the routing credential that came with this seat (`welcome.cred`), per TAB (sessionStorage) and
+     * BOUND to the token it was issued for: a credential for another token is never returned, so a duplicated
+     * tab, a new session or a fallback to another stored token cannot present the wrong seat's credential.
+     * @param {string} token the token from the same `welcome`
+     * @param {string} cred
+     */
+    saveCred(token, cred) {
+      if (!isToken(token) || !isCred(cred)) return;
+      sset(session, K_CRED, JSON.stringify({ h: tokenHash(token), c: cred }));
+    },
+    /** The credential for the token this tab currently uses (null when none, or when it belongs to another token). */
+    getCred() {
+      const c = readCred();
+      const t = tokenOf();
+      return c && t != null && c.h === tokenHash(t) ? c.c : null;
+    },
+    /** Forget this tab's credential (no routing hint until the next `welcome` brings one). */
+    clearCred() {
+      sdel(session, K_CRED);
+    },
+    /** Forget this tab's token and its credential (e.g. the server said the session is invalid). */
     clearToken() {
       const t = current || sget(session, K_TOKEN);
       current = null;
       sdel(session, K_TOKEN);
+      sdel(session, K_CRED); // the credential was issued for the token being forgotten
       if (t) writeRecent(readRecent().filter((x) => x !== t));
     },
     /** Whether this tab already passed the title screen (survives reloads, not new tabs). */
@@ -904,4 +980,4 @@ export function createIdentity(deps = {}) {
 export const identity = createIdentity();
 
 /** Browser connection singleton (created lazily-safe: nothing touches the network until connect()). */
-export const net = new Net({ getToken: () => identity.getToken() });
+export const net = new Net({ getToken: () => identity.getToken(), getCred: () => identity.getCred() });

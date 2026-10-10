@@ -27,6 +27,13 @@
 //   1008 abusive flooding (rate-limit drops > abuseDropsPerSec)
 //   1001 server shutdown
 //
+// Routing (phase 1, steps 2–3, server/sessionDirectory.js): when a session directory is configured, every `welcome`
+// carries an OPTIONAL `cred` — a signed, expiring routing credential for the seat — and an inbound upgrade may
+// present it as `/ws?cred=…`; it is verified before `hello` and its answer is kept on the session (`routeHint`) and
+// the connection (`route`). It NEVER authenticates: hello.token still does, and a credential that is absent,
+// expired, tampered or foreign changes nothing. With no directory configured, no `cred` is added and an incoming
+// `?cred=` is ignored — byte-identical to the server before this layer.
+//
 // The handler object (implemented by server/lobby.js) receives:
 //   onHello(session, { resumed, repeat })  after `welcome` was sent
 //   welcomeInfo() → object (optional)      extra fields of every `welcome` (never one of its own keys): the lobby's
@@ -42,6 +49,7 @@ import { isIP } from 'node:net';
 import { C2S, validateC2S } from '../shared/protocol.js';
 import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION } from '../shared/constants.js';
 import { isCompressibleType } from './wsCompression.js';
+import { routeCredentialFromUrl } from './sessionDirectory.js';
 
 /** Tunables (all overridable through the Network / SessionRegistry constructors). */
 export const NET_DEFAULTS = Object.freeze({
@@ -146,6 +154,12 @@ export class Session {
      * window). A solo run keeps its session resumable for the official `singleReconnectTime` (24 h) — see lobby.js.
      */
     this.resumeWindowMs = null;
+    /**
+     * @type {{ mine: boolean, slot: string, instanceId: string } | null} net-owned: the verified routing credential
+     * this socket arrived with (null when it carried none, or one that did not verify). `mine` is true only when the
+     * directory says the seat belongs to THIS instance and slot; the credential itself is never kept on the session.
+     */
+    this.routeHint = null;
   }
 }
 
@@ -572,6 +586,12 @@ class Connection {
     this.drops = 0;
     /** true once the server initiated the close; frames still in flight are ignored */
     this.closing = false;
+    /**
+     * @type {{ mine: boolean, slot: string, instanceId: string, sid: string } | null} the routing credential this
+     * socket's upgrade carried, already verified against the ownership directory (null otherwise). The credential
+     * string itself is deliberately not kept here: nothing downstream (or in a log) needs it.
+     */
+    this.route = null;
   }
 
   /** Server-initiated close (never throws). Later frames from this socket are ignored. */
@@ -590,14 +610,17 @@ export class Network {
    * @param {{
    *   registry: SessionRegistry,
    *   handler: { onHello?: Function, onMessage: Function, onDisconnect?: Function, onExpire?: Function, welcomeInfo?: Function },
+   *   directory?: import('./sessionDirectory.js').SessionDirectory | null,
    *   log?: { info: Function, warn: Function, error: Function, debug?: Function },
    *   now?: () => number,
    *   options?: Partial<typeof NET_DEFAULTS>,
-   * }} opts
+   * }} opts directory: the shared ownership directory of the routing layer (null = routing off, the default: no
+   *   credential in `welcome`, an inbound `?cred=` is ignored — byte-identical to the server before this layer)
    */
-  constructor({ registry, handler, log = noopLog, now = Date.now, options = {} }) {
+  constructor({ registry, handler, directory = null, log = noopLog, now = Date.now, options = {} }) {
     this.registry = registry;
     this.handler = handler;
+    this.directory = directory;
     this.log = log;
     this.now = now;
     this.opts = { ...NET_DEFAULTS, ...options };
@@ -672,6 +695,7 @@ export class Network {
   handleConnection(ws, req) {
     if (this.closed) { try { ws.close(CLOSE.SHUTDOWN, 'server shutdown'); } catch { /* ignore */ } return; }
     const conn = new Connection(ws, clientAddress(req, this.opts.trustProxy), this.now(), this.opts);
+    conn.route = this.routeCredential(req);
     this.conns.set(ws, conn);
     linkState(ws);   // the link probe's per-socket ring (probeLinks / linkQualityOf)
     if (conn.key) this.connsPerKey.set(conn.key, (this.connsPerKey.get(conn.key) || 0) + 1);
@@ -686,6 +710,48 @@ export class Network {
     });
     ws.on('error', (e) => { this.log.debug?.('[net] socket error', e?.code || e?.message); });
     ws.on('close', () => { try { this.onClose(conn); } catch (e) { this.log.error('[net] close handler crashed', e); } });
+  }
+
+  /**
+   * What this process considers the peer's address — the same answer `handleConnection` will use as its per-network
+   * limit key. Step 3 forwards it so the owning slot still counts the real client against its cap even though the
+   * socket arrives from loopback.
+   * @param {import('node:http').IncomingMessage | undefined} req
+   * @returns {string}
+   */
+  clientIpOf(req) {
+    return clientAddress(req, this.opts.trustProxy).ip;
+  }
+
+  /**
+   * Verify the routing credential an upgrade carries against the ownership directory (phase 1, step 2). Never throws
+   * and never gates the socket: a credential that is absent, expired, tampered, unknown or names another slot
+   * simply yields null, and the connection is served exactly as before this layer existed. When it verifies, the
+   * directory (not the payload) is what says which slot/instance owns the seat, so `mine` answers "is it OURS?".
+   *
+   * The credential string and the token are never logged and never returned to a caller; only the slot/instance it
+   * resolved to. A directory that cannot be read resolves to "unknown", hence null — never to "mine".
+   * @param {import('node:http').IncomingMessage | undefined} req
+   * @returns {{ mine: boolean, slot: string, instanceId: string, sid: string } | null}
+   */
+  routeCredential(req) {
+    const directory = this.directory;
+    if (!directory) return null;
+    try {
+      const cred = routeCredentialFromUrl(req?.url);
+      if (!cred) return null;
+      const v = directory.resolveCredential(cred);
+      if (!v.ok) {
+        // The reason is a fixed word ('expired' / 'bad-signature' / …); the credential itself is never echoed.
+        this.log.debug?.(`[route] credential not used: ${v.reason}`);
+        return null;
+      }
+      const e = v.entry;
+      return { mine: e.instanceId === directory.instanceId && e.slot === directory.slot, slot: e.slot, instanceId: e.instanceId, sid: v.payload.s };
+    } catch (err) {
+      this.log.warn?.('[route] credential check failed', err?.message);
+      return null;
+    }
   }
 
   /** @param {Connection} conn @param {object} msg */
@@ -788,10 +854,27 @@ export class Network {
     session.pubCap = Number.isInteger(msg.pub) && msg.pub > 0 ? msg.pub : 0;
     session.pubBonds = Number.isInteger(msg.pubBonds) && msg.pubBonds > 0 ? msg.pubBonds : 0;
     session.pubDelta = Number.isInteger(msg.pubDelta) && msg.pubDelta > 0 ? msg.pubDelta : 0;
+    // What the upgrade proved about where this seat belongs (null when no credential verified). A repeated hello on
+    // the same socket keeps the same answer: it describes the socket's upgrade, not this message.
+    session.routeHint = conn.route;
+
+    // Routing credential for the seat (server/sessionDirectory.js): the client keeps it per tab and presents it on
+    // the WS URL when it reconnects, so a flip lands the socket back on the process that owns the session. Omitted
+    // entirely when the routing layer is off — an old client sees the same `welcome` it always did.
+    let credential = null;
+    if (this.directory) {
+      try {
+        const windowMs = Math.max(this.registry.windowOf?.(session) ?? this.opts.reconnectWindowMs, Number.isFinite(session.resumeWindowMs) ? session.resumeWindowMs : 0);
+        credential = this.directory.register(session.token, { roomCode: session.roomCode ?? null, recoverUntil: now + windowMs }).credential;
+      } catch (e) {
+        this.log.warn('[route] register failed', e?.message);
+      }
+    }
 
     let extra = null;
     try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
     const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed };
+    if (credential) welcome.cred = credential;
     if (validRid(rid)) welcome.rid = rid;
     this.reply(conn, welcome);
     try {

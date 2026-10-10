@@ -3,12 +3,15 @@
 //   * PORT (default 3000), HOST (default '::', one dual-stack socket for IPv6 and IPv4);
 //   * TRUST_PROXY ('auto' default: honour CF-Connecting-IP / X-Real-IP / X-Forwarded-For only from loopback/private
 //     peers such as a local cloudflared; '1' always; '0' never) → net.js trustProxy;
+//   * the session-routing layer (SP_ROUTE_DIRECTORY / SP_ROUTE_SECRET / SP_ROUTE_SLOT / SP_ROUTE_INSTANCE /
+//     SP_ROUTE_PEERS → server/sessionDirectory.js): OFF unless a directory file AND a secret are both configured;
 //   * DEBUG → the console logger's debug level;
 //   * the served directories (public/, data/, shared/ and the content packs' packs/ of this repository unless the
 //     options name others), and which startServer() options are handed on to net.js Network and lobby.js Lobby.
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { newInstanceId } from '../sessionDirectory.js';
 
 /** Repository root. */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -81,6 +84,56 @@ export function lobbyOptionsFrom(opts) {
     if (opts[k] != null) lobbyOptions[k] = opts[k];
   }
   return lobbyOptions;
+}
+
+/**
+ * The box's slot map as the routing layer wants it: `SP_ROUTE_PEERS="A=3002,B=3001"` → `{ A: 3002, B: 3001 }`.
+ * Only loopback ports are useful here (the forwarder never dials anything else), so junk entries are dropped.
+ * @param {string | undefined} spec
+ * @returns {Record<string, number>}
+ */
+export function parseRoutePeers(spec) {
+  const out = {};
+  for (const part of String(spec ?? '').split(',')) {
+    const m = /^([A-Za-z0-9_-]{1,16})=(\d{1,5})$/.exec(part.trim());
+    if (!m) continue;
+    const port = Number(m[2]);
+    if (port >= 1 && port <= 65535) out[m[1]] = port;
+  }
+  return out;
+}
+
+/**
+ * Session-routing layer (server/sessionDirectory.js, phase 1 step 2/3): startServer() options win over the
+ * environment, like the other option groups.
+ *
+ *   SP_ROUTE_DIRECTORY  the shared ownership-directory JSON file — BOTH slots must point at ONE file
+ *   SP_ROUTE_SECRET     the HMAC secret of the routing credential (never the reconnect token)
+ *   SP_ROUTE_SLOT       this slot's name (e.g. A/B) `SP_ROUTE_INSTANCE` its instance id (default: random per process)
+ *   SP_ROUTE_PEERS      "<slot>=<loopback port>[,<slot>=<port>…]": where the OTHER slots listen on 127.0.0.1
+ *
+ * Returns null — the feature completely OFF, `welcome` without a credential, no forwarding — unless a directory
+ * file AND a secret are both configured. That is what makes the layer reversible in one step (unset the two
+ * variables) and what keeps a missing/renamed file from changing any behaviour.
+ * @param {{ route?: false | object, [option: string]: any }} opts startServer() options
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function routeOptionsFrom(opts = {}, env = process.env) {
+  if (opts.route === false) return null;
+  const o = opts.route && typeof opts.route === 'object' ? opts.route : {};
+  const file = o.file ?? env.SP_ROUTE_DIRECTORY ?? '';
+  const secret = o.secret ?? env.SP_ROUTE_SECRET ?? '';
+  if (!file || !secret) return null;
+  const slot = String(o.slot ?? env.SP_ROUTE_SLOT ?? 'A');
+  return {
+    file,
+    secret,
+    slot,
+    instanceId: o.instanceId ?? env.SP_ROUTE_INSTANCE ?? newInstanceId(slot.toLowerCase()),
+    peers: o.peers ?? parseRoutePeers(env.SP_ROUTE_PEERS),
+    leaseMs: o.leaseMs,
+    credentialMs: o.credentialMs,
+  };
 }
 
 /** TRUST_PROXY env → net.js trustProxy ('auto' unless explicitly on/off). @param {string | undefined} v */
