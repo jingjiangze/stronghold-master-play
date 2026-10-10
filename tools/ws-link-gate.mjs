@@ -38,10 +38,22 @@ want('sendRaw accepts a compress flag', 'server/net.js', net && /compress/.test(
 const lobby = read('server/lobby.js');
 want('broadcastRoom passes compress', 'server/lobby.js', lobby && /isCompressibleType/.test(lobby) && /sendRaw\([^)]*compress/.test(lobby), 'pass compress in broadcastRoom (m.public is broadcast, not unicast)');
 
-// 4. the other fork-only layer on the same wire: the link-adaptive snapshot rate
+// 4. the other fork-only layer on the same wire: the two-tier per-WATCHER snapshot cadence.
+//    Two independent cadences, chosen by whether you drive the field: SNAPSHOT_EVERY for a player of it,
+//    SNAPSHOT_EVERY_IDLE for a mere watcher. Upstream shipped neither constant nor the split, so a sync
+//    reverts it silently — the battle still runs and the frames still arrive, just 4× as often as they
+//    need to for everyone who only watches. That is invisible in a smoke test and only shows up on the
+//    box's uplink graph, which is the whole reason this gate exists.
 want('snapRate module exists', 'server/match/snapRate.js', read('server/match/snapRate.js'), 'restore server/match/snapRate.js (fork addition)');
+const constants = read('server/sim/constants.js');
+want('constants.js names the idle cadence', 'server/sim/constants.js', constants && /export const SNAPSHOT_EVERY_IDLE/.test(constants), 'restore SNAPSHOT_EVERY_IDLE (fork addition; upstream has only the base rate)');
 const fields = read('server/match/fields.js');
-want('fields.js consults the adaptive rate', 'server/match/fields.js', fields && /snapIsFast|_everyFor/.test(fields), 'restore the snapRate wiring in _emit/_tick');
+want('fields.js imports the idle cadence', 'server/match/fields.js', fields && /SNAPSHOT_EVERY_IDLE/.test(fields), 'restore the import in server/match/fields.js');
+want('fields.js splits the cadence by whether the watcher drives the field', 'server/match/fields.js', fields && /IDLE_SNAP_EVERY/.test(fields) && /f\.players\.includes\(pid\)/.test(fields), 'restore the per-watcher `every` in _emit');
+// The retired link-adaptive gear: SNAPSHOT_EVERY_FAST naming a second rate is exactly what a re-arm must
+// not stumble over, so this is the one check that FAILS in the desired direction — it fires when someone
+// re-arms the gear, and says which way to move. See server/match/snapRate.js for the kept thresholds.
+want('no second rate is armed (SNAPSHOT_EVERY_FAST === SNAPSHOT_EVERY)', 'server/sim/constants.js', constants && /export const SNAPSHOT_EVERY_FAST = SNAPSHOT_EVERY;/.test(constants), 'EXPECTED if you re-armed the adaptive gear: delete this check and restore the old one from git history');
 
 // 5. the box updater must keep writing the switch, or a slot flip silently disables compression
 const box = read('tools/box/sp_update_zip.ps1');
@@ -53,7 +65,8 @@ if (bad.length) {
   console.log(`\n${bad.length} of ${checks.length} checks failed — the upstream sync dropped the WS-link layer.`);
   for (const c of bad) console.log(`  fix: ${c.fix}  [${c.file}]`);
   console.log('\nSilent revert looks like: the server runs fine, but the handshake stops offering');
-  console.log('permessage-deflate. Verify on the live slot with a real Upgrade handshake, not a HEAD request.');
+  console.log('permessage-deflate, and every watcher pays the driver\'s 20 Hz. Verify on the live slot with');
+  console.log('a real Upgrade handshake, not a HEAD request.');
   process.exit(1);
 }
 console.log(`\nall ${checks.length} checks passed — the WS-link layer is intact.`);
